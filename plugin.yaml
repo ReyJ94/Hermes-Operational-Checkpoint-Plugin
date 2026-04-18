@@ -1,0 +1,3 @@
+name: operational-checkpoint
+version: 0.1.0
+description: "Hermes Operational Checkpoint plugin for long-running tasks: replaces stock compaction with dense operational checkpoints and plugin-owned CLI surfacing."

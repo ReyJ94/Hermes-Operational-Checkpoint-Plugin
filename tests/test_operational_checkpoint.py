@@ -1,0 +1,2276 @@
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import sys
+import tomllib
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+ROOT: Path = Path(__file__).resolve().parents[1]
+PLUGIN_ENTRYPOINT: Path = ROOT / "__init__.py"
+PluginModules = tuple[ModuleType, ModuleType, ModuleType, ModuleType]
+
+
+def load_plugin_entrypoint() -> ModuleType:
+    module_name = "operational_checkpoint_plugin_entrypoint"
+    if module_name in sys.modules:
+        cached_module: ModuleType = sys.modules[module_name]
+        return cached_module
+
+    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_ENTRYPOINT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not create plugin entrypoint module spec")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def plugin_modules() -> PluginModules:
+    entrypoint_module = load_plugin_entrypoint()
+    compressor_module = importlib.import_module("operational_checkpoint.compressor")
+    helpers_module = importlib.import_module("operational_checkpoint.helpers")
+    sidecar_module = importlib.import_module("operational_checkpoint.sidecar")
+    return entrypoint_module, compressor_module, helpers_module, sidecar_module
+
+
+def test_registers_context_engine(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, _compressor_module, _helpers_module, _sidecar_module = plugin_modules
+    install_calls: list[str] = []
+
+    class Collector:
+        def __init__(self) -> None:
+            self.engine: object | None = None
+
+        def register_context_engine(self, engine: object) -> None:
+            self.engine = engine
+
+    monkeypatch.setitem(
+        package.register.__globals__,
+        "install_plugin_sidecar",
+        lambda: install_calls.append("installed"),
+    )
+
+    collector = Collector()
+    package.register(collector)
+
+    engine = collector.engine
+    assert engine is not None
+    assert getattr(engine, "name") == "operational_checkpoint"
+    assert install_calls == ["installed"]
+
+
+def test_install_plugin_sidecar_defers_when_cli_is_partially_initialized(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    partial_cli_module = ModuleType("cli")
+    partial_run_agent_module = ModuleType("run_agent")
+    scheduled_calls: list[str] = []
+
+    monkeypatch.setitem(sys.modules, "cli", partial_cli_module)
+    monkeypatch.setitem(sys.modules, "run_agent", partial_run_agent_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "_schedule_deferred_install",
+        lambda: scheduled_calls.append("scheduled"),
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "install_runtime_bridge",
+        lambda **_kwargs: pytest.fail("bridge should not install before HermesCLI exists"),
+    )
+
+    sidecar_module.install_plugin_sidecar()
+
+    assert scheduled_calls == ["scheduled"]
+
+
+def test_install_plugin_sidecar_installs_when_targets_are_ready(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+
+    class FakeCLI:
+        session_id = "session-1"
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+
+    class FakeAgent:
+        def _compress_context(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[object, object]:
+            del args, kwargs
+            return [], ""
+
+    cli_module = ModuleType("cli")
+    cli_module.HermesCLI = FakeCLI
+    run_agent_module = ModuleType("run_agent")
+    run_agent_module.AIAgent = FakeAgent
+    captured: dict[str, object] = {}
+
+    monkeypatch.setitem(sys.modules, "cli", cli_module)
+    monkeypatch.setitem(sys.modules, "run_agent", run_agent_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "_schedule_deferred_install",
+        lambda: pytest.fail("deferred install should not be needed"),
+    )
+
+    def fake_install_runtime_bridge(
+        *,
+        cli_class: type[object],
+        agent_class: type[object],
+    ) -> None:
+        captured["cli_class"] = cli_class
+        captured["agent_class"] = agent_class
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "install_runtime_bridge",
+        fake_install_runtime_bridge,
+    )
+
+    sidecar_module.install_plugin_sidecar()
+
+    assert captured == {
+        "cli_class": FakeCLI,
+        "agent_class": FakeAgent,
+    }
+
+
+def test_prompt_uses_operational_checkpoint_sections(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, max_tokens, main_runtime
+        captured["task"] = task
+        captured["prompt"] = messages[0]["content"]
+        captured["extra_body"] = extra_body
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "Objective\n- Continue the task\n\n"
+                            "Action frontier\n- Run the next probe"
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    result = engine._generate_summary(
+        [{"role": "user", "content": "Investigate the adapter failure"}],
+        focus_topic="adapter failure",
+    )
+
+    prompt = str(captured["prompt"])
+    assert captured["task"] == "compression"
+    assert captured["extra_body"] == {"reasoning": {"effort": "medium"}}
+    assert "Operational state" in prompt
+    assert "Transferable patterns learned this run" in prompt
+    assert "Action frontier" in prompt
+    assert "Critical invariants / regression risks" in prompt
+    assert "FOCUS TOPIC: adapter failure" in prompt
+    assert result is not None
+    assert result.startswith(compressor_module.SUMMARY_PREFIX)
+
+
+def test_runtime_defaults_drive_threshold_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+
+    assert engine.name == "operational_checkpoint"
+    assert engine.context_length == 200_000
+    assert engine.threshold_tokens == 175_000
+    assert engine.protect_first_n == 2
+    assert engine.protect_last_n == 3
+    assert engine.tail_token_budget == 18_000
+
+
+def test_operational_checkpoint_is_a_direct_context_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+    from agent.context_engine import ContextEngine
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+
+    assert isinstance(engine, ContextEngine)
+
+
+def test_compress_uses_plugin_owned_checkpoint_assembly_and_updates_previous_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 2,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 80,
+        },
+    )
+
+    prompts: list[str] = []
+    summaries = iter(
+        [
+            "Objective\n- first checkpoint\n\nAction frontier\n- next probe",
+            "Objective\n- updated checkpoint\n\nAction frontier\n- continue",
+        ]
+    )
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, max_tokens, extra_body, main_runtime
+        prompts.append(messages[0]["content"])
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=next(summaries)
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    initial_history = [
+        {"role": "user", "content": "u0 " + ("x" * 280)},
+        {"role": "assistant", "content": "a0 " + ("y" * 280)},
+        {"role": "user", "content": "u1 " + ("x" * 280)},
+        {"role": "assistant", "content": "a1 " + ("y" * 280)},
+        {"role": "user", "content": "u2 " + ("x" * 280)},
+        {"role": "assistant", "content": "a2 " + ("y" * 280)},
+    ]
+
+    compressed_once = engine.compress(initial_history, focus_topic="adapter seam")
+
+    checkpoint_messages_once = [
+        message for message in compressed_once
+        if compressor_module.SUMMARY_PREFIX in str(message.get("content", ""))
+    ]
+    assert engine.compression_count == 1
+    assert len(checkpoint_messages_once) == 1
+    assert "PREVIOUS CHECKPOINT" not in prompts[0]
+    assert "FOCUS TOPIC: adapter seam" in prompts[0]
+
+    second_history = list(compressed_once) + [
+        {"role": "user", "content": "u3 " + ("x" * 280)},
+        {"role": "assistant", "content": "a3 " + ("y" * 280)},
+        {"role": "user", "content": "u4 " + ("x" * 280)},
+        {"role": "assistant", "content": "a4 " + ("y" * 280)},
+    ]
+
+    compressed_twice = engine.compress(second_history)
+
+    checkpoint_messages_twice = [
+        message for message in compressed_twice
+        if compressor_module.SUMMARY_PREFIX in str(message.get("content", ""))
+    ]
+    assert engine.compression_count == 2
+    assert len(checkpoint_messages_twice) == 1
+    assert "PREVIOUS CHECKPOINT:\nObjective\n- first checkpoint" in prompts[1]
+    assert "NEW TURNS TO INCORPORATE:" in prompts[1]
+    assert engine.last_checkpoint_summary.startswith("Objective\n- updated checkpoint")
+
+
+def test_compress_inserts_plugin_owned_fallback_checkpoint_when_summary_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 2,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 80,
+        },
+    )
+
+    call_attempts: list[int] = []
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, messages, max_tokens, extra_body, main_runtime
+        call_attempts.append(1)
+        raise RuntimeError("summary unavailable")
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    compacted = engine.compress(
+        [
+            {"role": "user", "content": "u0 " + ("x" * 280)},
+            {"role": "assistant", "content": "a0 " + ("y" * 280)},
+            {"role": "user", "content": "u1 " + ("x" * 280)},
+            {"role": "assistant", "content": "a1 " + ("y" * 280)},
+            {"role": "user", "content": "u2 " + ("x" * 280)},
+            {"role": "assistant", "content": "a2 " + ("y" * 280)},
+        ]
+    )
+
+    checkpoint_messages = [
+        message for message in compacted
+        if compressor_module.SUMMARY_PREFIX in str(message.get("content", ""))
+    ]
+    assert engine.compression_count == 1
+    assert len(checkpoint_messages) == 1
+    assert "Summary generation was unavailable" in str(
+        checkpoint_messages[0].get("content", "")
+    )
+    assert "Summary generation was unavailable" in engine.last_checkpoint_summary
+    assert len(call_attempts) == 3
+
+
+def test_compress_retries_empty_summary_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 2,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 80,
+        },
+    )
+
+    call_attempts: list[int] = []
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, messages, max_tokens, extra_body, main_runtime
+        call_attempts.append(1)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="   "))]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    compacted = engine.compress(
+        [
+            {"role": "user", "content": "u0 " + ("x" * 280)},
+            {"role": "assistant", "content": "a0 " + ("y" * 280)},
+            {"role": "user", "content": "u1 " + ("x" * 280)},
+            {"role": "assistant", "content": "a1 " + ("y" * 280)},
+            {"role": "user", "content": "u2 " + ("x" * 280)},
+            {"role": "assistant", "content": "a2 " + ("y" * 280)},
+        ]
+    )
+
+    checkpoint_messages = [
+        message for message in compacted
+        if compressor_module.SUMMARY_PREFIX in str(message.get("content", ""))
+    ]
+    assert len(call_attempts) == 3
+    assert len(checkpoint_messages) == 1
+    assert "Summary generation was unavailable" in str(
+        checkpoint_messages[0].get("content", "")
+    )
+
+
+def test_sidecar_bridge_emits_auto_status_and_records_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    stored_states: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": True,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: dict(stored_states),
+    )
+
+    def save_states(states: dict[str, object], hermes_home: object | None = None) -> None:
+        del hermes_home
+        stored_states.clear()
+        stored_states.update(states)
+
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", save_states)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.last_completion_tokens = 0
+            self.last_checkpoint_summary = ""
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del messages, current_tokens
+            self.compression_count += 1
+            self.last_checkpoint_summary = (
+                "Goal keep moving. Run the next discriminating probe."
+            )
+            if self.callback is not None:
+                self.callback(
+                    {
+                        "focus_topic": focus_topic,
+                        "summary": self.last_checkpoint_summary,
+                    }
+                )
+            return [{"role": "user", "content": "checkpoint"}]
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self._cached_system_prompt = ""
+            self._context_pressure_warned_at = 0.0
+            self._session_db = None
+            self.printed: list[str] = []
+            self.session_id = "session_123"
+            self.tools: list[dict[str, object]] = []
+
+        def _safe_print(self, line: str) -> None:
+            self.printed.append(line)
+
+        def flush_memories(
+            self,
+            messages: list[dict[str, object]],
+            min_turns: int = 0,
+        ) -> None:
+            del messages, min_turns
+
+        def _invalidate_system_prompt(self) -> None:
+            self._cached_system_prompt = ""
+
+        def _build_system_prompt(self, system_message: str) -> str:
+            return system_message
+
+        def _compress_context(self, *args: object, **kwargs: object) -> tuple[list[dict[str, object]], str]:
+            del args, kwargs
+            raise AssertionError("plugin-owned compaction should bypass the original _compress_context")
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+            self.agent._compress_context(
+                [{"role": "user", "content": "manual"}],
+                "",
+                approx_tokens=90_000,
+                focus_topic="manual focus",
+            )
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+    assert cli.agent.context_compressor.callback is not None
+
+    compressed, _system_prompt = cli.agent._compress_context(
+        [{"role": "user", "content": "auto"}] * 8,
+        "",
+        approx_tokens=123_456,
+        focus_topic="adapter seam",
+    )
+    expected_tokens_before = sidecar_module.estimate_request_tokens_rough(
+        [{"role": "user", "content": "auto"}] * 8,
+        system_prompt="",
+        tools=[],
+    )
+    expected_tokens_after = sidecar_module.estimate_request_tokens_rough(
+        compressed,
+        system_prompt="",
+        tools=[],
+    )
+
+    assert compressed == [{"role": "user", "content": "checkpoint"}]
+    assert cli.agent.printed[0] == (
+        f"🗜️  Operational Checkpoint: auto-compacting ~{expected_tokens_before:,} / 350,000 "
+        'tokens, focus: "adapter seam"...'
+    )
+    assert cli.agent.printed[1] == (
+        "  ✅ Operational Checkpoint reduced active context budget: "
+        f"~{expected_tokens_before:,} → ~{expected_tokens_after:,} tokens"
+    )
+    assert cli.agent.printed[2].startswith("     checkpoint: Goal keep moving.")
+    artifact = sidecar_module.latest_compaction_artifact_for_cli(cli)
+    assert artifact is not None
+    assert artifact["focus_topic"] == "adapter seam"
+    assert artifact["trigger"] == "auto"
+    assert artifact["message_count_before"] == 8
+    assert artifact["message_count_after"] == 1
+    assert artifact["tokens_before"] == expected_tokens_before
+    assert artifact["tokens_after"] == expected_tokens_after
+    stored_record = stored_states["session_123"]
+    assert getattr(stored_record, "raw_message_count") == 8
+    assert getattr(stored_record, "tokens_after") == expected_tokens_after
+
+    before_manual = list(cli.agent.printed)
+    cli._manual_compress()
+    assert cli.agent.printed == before_manual
+    manual_artifact = sidecar_module.latest_compaction_artifact_for_cli(cli)
+    assert manual_artifact is not None
+    assert manual_artifact["trigger"] == "manual"
+    assert manual_artifact["focus_topic"] == "manual focus"
+
+
+def test_runtime_defaults_use_plugin_toml_model_and_reasoning_only(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        helpers_module,
+        "load_plugin_root_config",
+        lambda: {
+            "defaults": {
+                "model": "plugin-model",
+                "reasoning_effort": "high",
+                "summary_retry_attempts": 3,
+                "context_limit_tokens": 400_000,
+                "auto_compact_at_tokens": 350_000,
+                "head_preserve_messages": 3,
+                "minimum_tail_messages": 3,
+                "tail_preserve_tokens": 20_000,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        helpers_module,
+        "load_config",
+        lambda: {
+            "model": {
+                "default": "global-model",
+                "provider": "global-provider",
+                "base_url": "https://example.invalid",
+                "context_length": 999_999,
+            },
+            "operational_checkpoint": {
+                "model": "global-plugin-override",
+                "reasoning_effort": "minimal",
+            },
+        },
+    )
+
+    defaults = helpers_module.load_runtime_defaults()
+
+    assert defaults["model"] == "plugin-model"
+    assert defaults["reasoning_effort"] == "high"
+
+
+def test_runtime_defaults_allow_zero_protection_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        helpers_module,
+        "load_plugin_root_config",
+        lambda: {
+            "defaults": {
+                "model": "plugin-model",
+                "reasoning_effort": "medium",
+                "summary_retry_attempts": 3,
+                "context_limit_tokens": 400_000,
+                "auto_compact_at_tokens": 350_000,
+                "head_preserve_messages": 0,
+                "minimum_tail_messages": 0,
+                "tail_preserve_tokens": 0,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        helpers_module,
+        "load_config",
+        lambda: {
+            "model": {
+                "context_length": 400_000,
+            },
+            "operational_checkpoint": {},
+        },
+    )
+
+    defaults = helpers_module.load_runtime_defaults()
+
+    assert defaults["head_preserve_messages"] == 0
+    assert defaults["minimum_tail_messages"] == 0
+    assert defaults["tail_preserve_tokens"] == 0
+
+
+def test_runtime_defaults_match_actual_plugin_toml(
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, helpers_module, _sidecar_module = plugin_modules
+
+    defaults = helpers_module.load_runtime_defaults()
+    engine = compressor_module.OperationalCheckpointCompressor()
+
+    assert defaults["model"] == "gpt-5.4-mini"
+    assert defaults["reasoning_effort"] == "medium"
+    assert engine.model == "gpt-5.4-mini"
+    assert engine.reasoning_effort == "medium"
+
+
+def test_load_plugin_root_config_falls_back_to_packaged_config(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+    tmp_path: Path,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+
+    missing_root_config = tmp_path / "missing-operational-checkpoint.toml"
+    packaged_config = tmp_path / "operational_checkpoint.toml"
+    packaged_config.write_text(
+        "[defaults]\n"
+        'model = "packaged-model"\n'
+        'reasoning_effort = "low"\n'
+        "summary_retry_attempts = 3\n"
+        "context_limit_tokens = 400000\n"
+        "auto_compact_at_tokens = 350000\n"
+        "head_preserve_messages = 3\n"
+        "minimum_tail_messages = 3\n"
+        "tail_preserve_tokens = 20000\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(helpers_module, "PLUGIN_CONFIG_PATH", missing_root_config)
+    monkeypatch.setattr(
+        helpers_module,
+        "PACKAGED_PLUGIN_CONFIG_PATH",
+        packaged_config,
+        raising=False,
+    )
+
+    config = helpers_module.load_plugin_root_config()
+
+    assert config["defaults"]["model"] == "packaged-model"
+    assert config["defaults"]["reasoning_effort"] == "low"
+
+
+def test_pyproject_exposes_hermes_entrypoint_and_packaged_config() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    entrypoints = pyproject["project"]["entry-points"]["hermes_agent.plugins"]
+    assert entrypoints["operational_checkpoint"] == "operational_checkpoint"
+
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    assert "operational_checkpoint.toml" in package_data["operational_checkpoint"]
+
+
+def test_helpers_call_llm_forwards_main_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+    auxiliary_module = importlib.import_module("agent.auxiliary_client")
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr(auxiliary_module, "call_llm", fake_call_llm)
+
+    main_runtime = {
+        "model": "runtime-model",
+        "provider": "custom",
+        "base_url": "http://127.0.0.1:8765/v1",
+        "api_key": "dummy-key",
+        "api_mode": "chat_completions",
+    }
+    helpers_module.call_llm(
+        task="compression",
+        provider="custom",
+        model="runtime-model",
+        base_url="http://127.0.0.1:8765/v1",
+        api_key="dummy-key",
+        messages=[{"role": "user", "content": "checkpoint me"}],
+        max_tokens=None,
+        extra_body={"reasoning": {"effort": "medium"}},
+        main_runtime=main_runtime,
+    )
+
+    assert captured["provider"] == "custom"
+    assert captured["model"] == "runtime-model"
+    assert captured["base_url"] == "http://127.0.0.1:8765/v1"
+    assert captured["api_key"] == "dummy-key"
+    assert captured["main_runtime"] == main_runtime
+    assert captured["task"] == "compression"
+
+
+def test_generate_summary_passes_current_runtime_to_auxiliary_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del messages, max_tokens, extra_body
+        captured["task"] = task
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["main_runtime"] = main_runtime
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "Objective\n- Continue the task\n\n"
+                            "Action frontier\n- Run the next discriminating probe"
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.update_model(
+        "runtime-model",
+        context_length=200_000,
+        base_url="http://127.0.0.1:8765/v1",
+        api_key="dummy-key",
+        provider="custom",
+        api_mode="chat_completions",
+    )
+    result = engine._generate_summary(
+        [{"role": "user", "content": "Investigate the adapter failure"}],
+        focus_topic="adapter failure",
+    )
+
+    assert captured["task"] == "compression"
+    assert captured["provider"] == "custom"
+    assert captured["model"] == "runtime-model"
+    assert captured["base_url"] == "http://127.0.0.1:8765/v1"
+    assert captured["api_key"] == "dummy-key"
+    assert captured["main_runtime"] == {
+        "api_key": "dummy-key",
+        "api_mode": "chat_completions",
+        "base_url": "http://127.0.0.1:8765/v1",
+        "model": "runtime-model",
+        "provider": "custom",
+    }
+    assert result is not None
+
+
+def test_generate_summary_infers_custom_provider_from_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "http://127.0.0.1:8765/v1",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del task, messages, max_tokens, extra_body
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["main_runtime"] = main_runtime
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    result = engine._generate_summary(
+        [{"role": "user", "content": "Investigate the adapter failure"}],
+        focus_topic=None,
+    )
+
+    assert captured["provider"] == "custom"
+    assert captured["model"] == "gpt-5.4"
+    assert captured["base_url"] == "http://127.0.0.1:8765/v1"
+    assert captured["api_key"] is None
+    assert captured["main_runtime"] == {
+        "api_key": "",
+        "api_mode": "",
+        "base_url": "http://127.0.0.1:8765/v1",
+        "model": "gpt-5.4",
+        "provider": "custom",
+    }
+    assert result is not None
+
+
+def test_generate_summary_explicit_runtime_overrides_upstream_auxiliary_compression_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4-mini",
+            "provider": "openai-codex",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del messages, max_tokens, extra_body
+        captured["task"] = task
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["main_runtime"] = main_runtime
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    result = engine._generate_summary(
+        [{"role": "user", "content": "Investigate the adapter failure"}],
+        focus_topic=None,
+    )
+
+    assert captured["task"] == "compression"
+    assert captured["provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["base_url"] is None
+    assert captured["api_key"] is None
+    assert captured["main_runtime"] == {
+        "api_key": "",
+        "api_mode": "",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "model": "gpt-5.4-mini",
+        "provider": "openai-codex",
+    }
+    assert result is not None
+
+
+def test_generate_summary_does_not_force_codex_base_url_as_custom_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4-mini",
+            "provider": "openai-codex",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del task, messages, max_tokens, extra_body
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["main_runtime"] = main_runtime
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    result = engine._generate_summary(
+        [{"role": "user", "content": "Investigate the adapter failure"}],
+        focus_topic=None,
+    )
+
+    assert captured["provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["base_url"] is None
+    assert captured["api_key"] is None
+    assert captured["main_runtime"] == {
+        "api_key": "",
+        "api_mode": "",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "model": "gpt-5.4-mini",
+        "provider": "openai-codex",
+    }
+    assert result is not None
+
+
+def test_compressor_restores_persisted_usage_and_rolls_over_child_session(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+    tmp_path: Path,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.on_session_start("session-parent", hermes_home=str(tmp_path))
+    engine.update_from_response(
+        {
+            "prompt_tokens": 240,
+            "completion_tokens": 30,
+            "total_tokens": 270,
+        }
+    )
+
+    restored = compressor_module.OperationalCheckpointCompressor()
+    restored.on_session_start("session-parent", hermes_home=str(tmp_path))
+
+    assert restored.last_prompt_tokens == 240
+    assert restored.last_completion_tokens == 30
+    assert restored.last_total_tokens == 270
+
+    restored.rollover_usage_snapshot(
+        new_session_id="session-child",
+        post_compaction_tokens=91,
+    )
+
+    child = compressor_module.OperationalCheckpointCompressor()
+    child.on_session_start("session-child", hermes_home=str(tmp_path))
+
+    assert child.last_prompt_tokens == 91
+    assert child.last_completion_tokens == 0
+    assert child.last_total_tokens == 91
+
+
+def test_compressor_should_compress_prefers_current_tokens_when_provided(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.last_prompt_tokens = 90_000
+    engine.last_completion_tokens = 10_000
+    engine.last_total_tokens = 100_000
+
+    assert engine.should_compress(prompt_tokens=999_999) is True
+
+    engine.last_total_tokens = 200_000
+
+    assert engine.should_compress(prompt_tokens=0) is False
+
+
+def test_compressor_snapshot_payload_writes_only_behavioral_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.compression_count = 2
+    engine.last_checkpoint_focus_topic = "focus topic"
+    engine.last_checkpoint_summary = "checkpoint body"
+    engine.last_prompt_tokens = 240
+    engine.last_completion_tokens = 30
+    engine.last_total_tokens = 270
+
+    payload = engine._snapshot_payload()
+
+    assert set(payload) == {
+        "compression_count",
+        "last_checkpoint_focus_topic",
+        "last_checkpoint_summary",
+        "last_completion_tokens",
+        "last_prompt_tokens",
+        "last_total_tokens",
+        "updated_at",
+    }
+
+
+def test_compress_allows_zero_head_and_tail_and_summarizes_full_window(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 0,
+            "minimum_tail_messages": 0,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 0,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, max_tokens, extra_body, main_runtime
+        captured["prompt"] = messages[0]["content"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "Objective\n- compact the whole working view\n\n"
+                            "Action frontier\n- continue from the checkpoint"
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    history = [
+        {"role": "user", "content": "first-user payload"},
+        {"role": "assistant", "content": "first-assistant payload"},
+        {"role": "user", "content": "last-user payload"},
+        {"role": "assistant", "content": "last-assistant payload"},
+    ]
+
+    compacted = engine.compress(history)
+
+    assert engine.protect_first_n == 0
+    assert engine.protect_last_n == 0
+    assert engine.tail_token_budget == 0
+    assert len(compacted) == 1
+    assert compacted[0]["role"] == "assistant"
+    assert str(compacted[0]["content"]).startswith(compressor_module.SUMMARY_PREFIX)
+    prompt = str(captured["prompt"])
+    assert "first-user payload" in prompt
+    assert "last-assistant payload" in prompt
+
+
+def test_zero_minimum_tail_still_respects_positive_tail_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 1,
+            "minimum_tail_messages": 0,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 1_000,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, max_tokens, extra_body, main_runtime
+        captured["prompt"] = messages[0]["content"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "Objective\n- keep a raw tail\n\n"
+                            "Action frontier\n- continue from the preserved tail"
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    history = [
+        {"role": "user", "content": "head-anchor"},
+        {"role": "assistant", "content": "middle-one"},
+        {"role": "user", "content": "middle-two"},
+        {"role": "assistant", "content": "tail-three"},
+        {"role": "user", "content": "tail-four"},
+    ]
+
+    compacted = engine.compress(history)
+
+    assert compacted[0]["content"] == "head-anchor"
+    assert compacted[-1]["content"] == "tail-four"
+    assert any(
+        str(message.get("content", "")).startswith(compressor_module.SUMMARY_PREFIX)
+        for message in compacted
+    )
+    prompt = str(captured["prompt"])
+    assert "middle-one" in prompt
+    assert "tail-four" not in prompt
+
+
+def test_sidecar_init_does_not_seed_missing_snapshot_from_loaded_history(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: {},
+    )
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", lambda *args, **kwargs: None)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.context_length = 400_000
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.restore_calls = 0
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            self.restore_calls += 1
+            return False
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.session_id = "session-seed"
+            self.conversation_history = [
+                {"role": "user", "content": "alpha " + ("x" * 160)},
+                {"role": "assistant", "content": "beta " + ("y" * 120)},
+            ]
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del messages, runtime_kwargs
+            return ([{"role": "user", "content": "checkpoint"}], system_message)
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+    assert cli.agent.context_compressor.restore_calls == 1
+    assert cli.agent.context_compressor.last_prompt_tokens == 0
+    assert cli.agent.context_compressor.last_completion_tokens == 0
+
+
+def test_sidecar_init_binds_engine_to_upstream_selected_child_session(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: {},
+    )
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", lambda *args, **kwargs: None)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.restore_calls = 0
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            self.restore_calls += 1
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.printed: list[str] = []
+            self.session_id = "session-root"
+
+        def _safe_print(self, line: str) -> None:
+            self.printed.append(line)
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del messages, runtime_kwargs
+            return ([{"role": "user", "content": "checkpoint"}], system_message)
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.session_id = "session-root"
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            self.session_id = "session-child"
+            self.agent.session_id = "session-child"
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+    assert cli.session_id == "session-child"
+    assert cli.agent.session_id == "session-child"
+    assert cli.agent.context_compressor.bound_session_id == "session-child"
+    assert cli.agent.context_compressor.restore_calls == 1
+    assert cli.agent.printed == []
+
+
+def test_sidecar_init_binds_engine_to_upstream_selected_lineage_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: {},
+    )
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", lambda *args, **kwargs: None)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.printed: list[str] = []
+            self.session_id = "session-root"
+
+        def _safe_print(self, line: str) -> None:
+            self.printed.append(line)
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del messages, runtime_kwargs
+            return ([{"role": "user", "content": "checkpoint"}], system_message)
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.session_id = "session-root"
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            self.session_id = "session-grandchild"
+            self.agent.session_id = "session-grandchild"
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+    assert cli.session_id == "session-grandchild"
+    assert cli.agent.session_id == "session-grandchild"
+    assert cli.agent.context_compressor.bound_session_id == "session-grandchild"
+    assert cli.agent.printed == []
+
+
+def test_sidecar_manual_compress_keeps_same_session_and_preserves_raw_upstream_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    stored_states: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: dict(stored_states),
+    )
+
+    def save_states(states: dict[str, object], hermes_home: object | None = None) -> None:
+        del hermes_home
+        stored_states.clear()
+        stored_states.update(states)
+
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", save_states)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.context_length = 400_000
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.persist_calls = 0
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            self.persist_calls += 1
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del messages, current_tokens
+            self.compression_count += 1
+            self.last_checkpoint_summary = "Objective\n- stay on this session"
+            if self.callback is not None:
+                self.callback(
+                    {
+                        "focus_topic": focus_topic,
+                        "summary": self.last_checkpoint_summary,
+                    }
+                )
+            return [{"role": "user", "content": "checkpoint"}]
+
+    class FakeSessionDB:
+        def __init__(self) -> None:
+            self.appended_messages: list[dict[str, object]] = []
+            self.ensure_calls: list[tuple[str, str, str]] = []
+            self.raw_messages: list[dict[str, object]] = [
+                {"role": "user", "content": "manual"}
+            ]
+
+        def ensure_session(self, session_id: str, source: str, model: str) -> None:
+            self.ensure_calls.append((session_id, source, model))
+
+        def append_message(self, **kwargs: object) -> None:
+            self.appended_messages.append(
+                {
+                    "role": kwargs.get("role"),
+                    "content": kwargs.get("content"),
+                }
+            )
+            self.raw_messages.append(
+                {
+                    "role": kwargs.get("role"),
+                    "content": kwargs.get("content"),
+                }
+            )
+
+        def get_messages_as_conversation(self, session_id: str) -> list[dict[str, object]]:
+            del session_id
+            return list(self.raw_messages)
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self._cached_system_prompt = ""
+            self._context_pressure_warned_at = 0.0
+            self._last_flushed_db_idx = 0
+            self._session_db = FakeSessionDB()
+            self.flushed_messages: list[dict[str, object]] = []
+            self.session_id = "session-parent"
+            self.tools: list[dict[str, object]] = []
+
+        def flush_memories(
+            self,
+            messages: list[dict[str, object]],
+            min_turns: int = 0,
+        ) -> None:
+            del messages, min_turns
+
+        def _invalidate_system_prompt(self) -> None:
+            self._cached_system_prompt = ""
+
+        def _build_system_prompt(self, system_message: str) -> str:
+            return f"{system_message}::built"
+
+        def _save_session_log(self, messages: list[dict[str, object]]) -> None:
+            self.saved_messages = list(messages)
+
+        def _flush_messages_to_session_db(
+            self,
+            messages: list[dict[str, object]],
+            conversation_history: list[dict[str, object]] | None = None,
+        ) -> None:
+            del conversation_history
+            self.flushed_messages = list(messages)
+            self._last_flushed_db_idx = len(messages)
+
+        def _compress_context(self, *args: object, **kwargs: object) -> tuple[list[dict[str, object]], str]:
+            del args, kwargs
+            raise AssertionError("plugin-owned compaction should bypass the original _compress_context")
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.session_id = "session-parent"
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+            self.agent._compress_context(
+                [{"role": "user", "content": "manual"}],
+                "",
+                approx_tokens=123_000,
+                focus_topic="manual focus",
+            )
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+
+    cli._manual_compress()
+    expected_tokens = sidecar_module.estimate_request_tokens_rough(
+        [{"role": "user", "content": "checkpoint"}],
+        system_prompt="::built",
+        tools=[],
+    )
+
+    assert cli.session_id == "session-parent"
+    assert cli.agent.session_id == "session-parent"
+    assert cli.agent.context_compressor.bound_session_id == "session-parent"
+    assert cli.agent.context_compressor.persist_calls == 1
+    assert cli.agent._session_db.appended_messages == []
+    stored_record = stored_states["session-parent"]
+    assert getattr(stored_record, "raw_message_count") == 1
+    assert getattr(stored_record, "compacted_messages") == [
+        {"role": "user", "content": "checkpoint"}
+    ]
+
+    cli.agent._save_session_log(
+        [
+            {"role": "user", "content": "checkpoint"},
+            {"role": "assistant", "content": "continued"},
+        ]
+    )
+    cli.agent._flush_messages_to_session_db(
+        [
+            {"role": "user", "content": "checkpoint"},
+            {"role": "assistant", "content": "continued"},
+        ],
+        conversation_history=[{"role": "user", "content": "manual"}],
+    )
+
+    assert cli.agent.saved_messages == [
+        {"role": "user", "content": "manual"},
+        {"role": "assistant", "content": "continued"},
+    ]
+    assert cli.agent._session_db.appended_messages == [
+        {"role": "assistant", "content": "continued"}
+    ]
+    assert cli.agent.context_compressor.last_prompt_tokens == expected_tokens
+    assert cli.agent.context_compressor.last_total_tokens == expected_tokens
+
+
+def test_sidecar_init_hydrates_resumed_history_from_plugin_state(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+
+    stored_record = sidecar_module.PersistedCompactionState(
+        compacted_messages=[{"role": "assistant", "content": "checkpoint"}],
+        compression_count=2,
+        focus_topic="resume",
+        raw_message_count=4,
+        summary="checkpoint",
+        tokens_after=11,
+        tokens_before=99,
+        updated_at=1.0,
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: {"session-child": stored_record},
+    )
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", lambda *args, **kwargs: None)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+    raw_history = [
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.session_id = "session-root"
+            self.tools: list[dict[str, object]] = []
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del messages, runtime_kwargs
+            return ([{"role": "user", "content": "checkpoint"}], system_message)
+
+    class FakeCLI:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.conversation_history = list(raw_history)
+            self.session_id = "session-root"
+
+        def _init_agent(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            self.session_id = "session-child"
+            self.agent.session_id = "session-child"
+            return True
+
+        def _manual_compress(self, cmd_original: str = "") -> None:
+            del cmd_original
+
+        def _handle_resume_command(self, cmd_original: str) -> None:
+            del cmd_original
+
+    sidecar_module.install_runtime_bridge(cli_class=FakeCLI, agent_class=FakeAgent)
+
+    cli = FakeCLI()
+    assert cli._init_agent() is True
+
+    expected_history = [
+        {"role": "assistant", "content": "checkpoint"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    expected_tokens = sidecar_module.estimate_request_tokens_rough(
+        expected_history,
+        system_prompt="",
+        tools=[],
+    )
+
+    assert cli.conversation_history == expected_history
+    assert cli.agent.context_compressor.bound_session_id == "session-child"
+    assert cli.agent.context_compressor.last_prompt_tokens == expected_tokens
+    assert sidecar_module.hydrated_cursor_for_agent(cli.agent) == 1
+
+
+def test_auto_preflight_compaction_continues_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+    tmp_path: Path,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+    import hermes_cli.plugins as plugins_mod
+    import run_agent
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  context_length: 70000\n"
+        "compression:\n"
+        "  enabled: true\n"
+        "context:\n"
+        "  engine: operational_checkpoint\n"
+        "operational_checkpoint:\n"
+        "  context_limit_tokens: 70000\n"
+        "  auto_compact_at_tokens: 1000\n"
+        "  head_preserve_messages: 3\n"
+        "  minimum_tail_messages: 3\n"
+        "  tail_preserve_tokens: 200\n"
+        "  summary_retry_attempts: 3\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+
+    def fake_summary_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, messages, max_tokens, extra_body, main_runtime
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            "Objective\n- Preserve operational state\n\n"
+                            "Action frontier\n- Continue after compaction"
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_summary_call_llm)
+
+    old_manager = plugins_mod._plugin_manager
+    manager = PluginManager()
+    plugins_mod._plugin_manager = manager
+    try:
+        ctx = PluginContext(PluginManifest(name="operational_checkpoint"), manager)
+        ctx.register_context_engine(compressor_module.OperationalCheckpointCompressor())
+
+        class TestAgent(run_agent.AIAgent):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                kwargs.update(
+                    skip_context_files=True,
+                    skip_memory=True,
+                    max_iterations=4,
+                    enabled_toolsets=[],
+                    quiet_mode=True,
+                    persist_session=False,
+                )
+                super().__init__(*args, **kwargs)
+                self._cleanup_task_resources = lambda *a, **k: None
+                self._persist_session = lambda *a, **k: None
+                self._save_trajectory = lambda *a, **k: None
+                self._save_session_log = lambda *a, **k: None
+
+            def run_conversation(
+                self,
+                msg: str,
+                conversation_history: list[dict[str, object]] | None = None,
+                task_id: str | None = None,
+            ) -> dict[str, object]:
+                self._interruptible_api_call = lambda kw: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            message=SimpleNamespace(
+                                role="assistant",
+                                content="continued after compaction",
+                                tool_calls=None,
+                                reasoning_content=None,
+                            ),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=120,
+                        completion_tokens=20,
+                        total_tokens=140,
+                    ),
+                    model="test-model",
+                )
+                self._disable_streaming = True
+                return super().run_conversation(
+                    msg,
+                    conversation_history=conversation_history,
+                    task_id=task_id,
+                )
+
+        history: list[dict[str, object]] = []
+        big_chunk = "x" * 900
+        for idx in range(4):
+            history.append({"role": "user", "content": f"user-{idx} {big_chunk}"})
+            history.append({"role": "assistant", "content": f"assistant-{idx} {big_chunk}"})
+
+        agent = TestAgent(
+            model="test-model",
+            base_url="http://127.0.0.1:8765/v1",
+            api_key="dummy-key",
+            provider="custom",
+            api_mode="chat_completions",
+            platform="cli",
+        )
+        original_session_id = agent.session_id
+        result = agent.run_conversation("final turn", conversation_history=history)
+
+        assert agent.context_compressor.name == "operational_checkpoint"
+        assert agent.context_compressor.compression_count == 1
+        assert agent.context_compressor.last_checkpoint_summary.startswith("Objective")
+        assert agent.session_id == original_session_id
+        assert result["final_response"] == "continued after compaction"
+    finally:
+        plugins_mod._plugin_manager = old_manager
