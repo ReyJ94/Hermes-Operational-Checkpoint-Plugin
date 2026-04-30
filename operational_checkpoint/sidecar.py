@@ -55,6 +55,7 @@ _AGENT_RUNTIME_STATE: WeakKeyDictionary[object, AgentRuntimeState] = WeakKeyDict
 class CompactionCallbackEngineLike(Protocol):
     name: str
     compression_count: int
+    context_length: int
     hermes_home: object
     last_checkpoint_summary: str
     last_completion_tokens: int
@@ -68,6 +69,8 @@ class CompactionCallbackEngineLike(Protocol):
         current_tokens: int | None = None,
         focus_topic: str | None = None,
     ) -> list[dict[str, object]]: ...
+
+    def update_from_response(self, usage: dict[str, object]) -> object: ...
 
     def set_compaction_callback(
         self,
@@ -239,6 +242,73 @@ def _bind_engine_session_state(agent: object, engine: CompactionCallbackEngineLi
 
 def _persist_engine_session_state(engine: CompactionCallbackEngineLike) -> None:
     engine.persist_usage_snapshot()
+
+
+def _find_tui_server_for_agent(agent: object) -> ModuleType | None:
+    module: ModuleType
+    for module in list(sys.modules.values()):
+        sessions: object = getattr(module, "_sessions", None)
+        emit: object = getattr(module, "_emit", None)
+        session_info: object = getattr(module, "_session_info", None)
+        if not isinstance(sessions, dict) or not callable(emit) or not callable(session_info):
+            continue
+        session: object
+        for session in sessions.values():
+            if isinstance(session, dict) and session.get("agent") is agent:
+                return module
+    return None
+
+
+def _emit_tui_usage_update(agent: object) -> None:
+    """Refresh the TUI's existing session.info usage snapshot after token changes."""
+    module: ModuleType | None = _find_tui_server_for_agent(agent)
+    if module is None:
+        return
+    sessions: object = getattr(module, "_sessions", None)
+    emit: object = getattr(module, "_emit", None)
+    session_info: object = getattr(module, "_session_info", None)
+    if not isinstance(sessions, dict) or not callable(emit) or not callable(session_info):
+        return
+    sid: str
+    session: object
+    for sid, session in sessions.items():
+        if not isinstance(sid, str) or not isinstance(session, dict):
+            continue
+        if session.get("agent") is not agent:
+            continue
+        try:
+            info_payload: object = session_info(agent)
+            if isinstance(info_payload, dict):
+                emit("session.info", sid, info_payload)
+        except Exception:
+            logger.debug("Operational Checkpoint TUI usage update failed", exc_info=True)
+        return
+
+
+def _install_usage_update_hook(agent: object, engine: CompactionCallbackEngineLike) -> None:
+    installed: object = getattr(engine, "_operational_checkpoint_usage_hook_installed", False)
+    if installed:
+        return
+    original_update: object = getattr(engine, "update_from_response", None)
+    if not callable(original_update):
+        return
+
+    def wrapped_update_from_response(usage: dict[str, object]) -> object:
+        result: object = original_update(usage)
+        _emit_tui_usage_update(agent)
+        return result
+
+    object.__setattr__(engine, "update_from_response", wrapped_update_from_response)
+    object.__setattr__(engine, "_operational_checkpoint_usage_hook_installed", True)
+
+
+def _bind_agent_runtime_hooks(agent: object) -> None:
+    engine: object = getattr(agent, "context_compressor", None)
+    if not is_compaction_callback_engine(engine):
+        return
+    _install_usage_update_hook(agent, engine)
+    if string_or_empty(getattr(agent, "platform", "")).strip().lower() == "tui":
+        _bind_engine_session_state(agent, engine)
 
 
 def _active_system_prompt(agent: object, fallback: str) -> str:
@@ -575,6 +645,7 @@ def _perform_plugin_owned_compaction(
     engine.last_completion_tokens = 0
     engine.last_total_tokens = compacted_tokens
     _persist_engine_session_state(engine)
+    _emit_tui_usage_update(agent)
     record: PersistedCompactionState | None = _persist_compaction_state(
         agent=agent,
         engine=engine,
@@ -660,6 +731,7 @@ def _bind_compaction_callback(cli: object, agent: object) -> None:
         _record_compaction_artifact(agent=agent, payload=payload)
 
     engine.set_compaction_callback(callback)
+    _bind_agent_runtime_hooks(agent)
     _bind_engine_session_state(agent, engine)
     _agent_runtime_state(agent).cli = cli
     _activate_hydrated_session_state(cli, agent, engine)
@@ -805,6 +877,23 @@ def _load_original_handle_resume_command(
     return original_handle_resume_command
 
 
+def _load_original_agent_init(
+    agent_class: type[AgentBridgeTarget],
+) -> Callable[..., None] | None:
+    candidate: object = agent_class.__dict__.get("__init__")
+    if not callable(candidate):
+        return None
+
+    def original_agent_init(
+        self: AgentBridgeTarget,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        candidate(self, *args, **kwargs)
+
+    return original_agent_init
+
+
 def _load_original_compress_context(
     agent_class: type[AgentBridgeTarget],
 ) -> Callable[..., tuple[object, object]]:
@@ -887,6 +976,20 @@ def _build_patched_init_agent(
         return result
 
     return patched_init_agent
+
+
+def _build_patched_agent_init(
+    original_agent_init: Callable[..., None],
+) -> Callable[..., None]:
+    def patched_agent_init(
+        self: AgentBridgeTarget,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_agent_init(self, *args, **kwargs)
+        _bind_agent_runtime_hooks(self)
+
+    return patched_agent_init
 
 
 def _build_patched_manual_compress(
@@ -1183,11 +1286,67 @@ def _build_patched_save_session_log(
     return patched_save_session_log
 
 
+def install_agent_runtime_bridge(
+    *,
+    agent_class: type[AgentBridgeTarget],
+) -> None:
+    bridge_installed: object = agent_class.__dict__.get(
+        "_operational_checkpoint_agent_bridge_installed",
+        False,
+    )
+    if bridge_installed:
+        return
+
+    original_agent_init: Callable[..., None] | None = _load_original_agent_init(agent_class)
+    original_compress_context: Callable[..., tuple[object, object]] = (
+        _load_original_compress_context(agent_class)
+    )
+    original_flush_messages_to_session_db: Callable[..., None] | None = (
+        _load_original_flush_messages_to_session_db(agent_class)
+    )
+    original_save_session_log: Callable[..., None] | None = (
+        _load_original_save_session_log(agent_class)
+    )
+
+    if original_agent_init is not None:
+        type.__setattr__(
+            agent_class,
+            "__init__",
+            _build_patched_agent_init(original_agent_init),
+        )
+    type.__setattr__(
+        agent_class,
+        "_compress_context",
+        _build_patched_compress_context(original_compress_context),
+    )
+    if original_flush_messages_to_session_db is not None:
+        type.__setattr__(
+            agent_class,
+            "_flush_messages_to_session_db",
+            _build_patched_flush_messages_to_session_db(
+                original_flush_messages_to_session_db
+            ),
+        )
+    if original_save_session_log is not None:
+        type.__setattr__(
+            agent_class,
+            "_save_session_log",
+            _build_patched_save_session_log(original_save_session_log),
+        )
+    type.__setattr__(
+        agent_class,
+        "_operational_checkpoint_agent_bridge_installed",
+        True,
+    )
+
+
 def install_runtime_bridge(
     *,
     cli_class: type[CLIBridgeTarget],
     agent_class: type[AgentBridgeTarget],
 ) -> None:
+    install_agent_runtime_bridge(agent_class=agent_class)
+
     bridge_installed: object = cli_class.__dict__.get(
         "_operational_checkpoint_bridge_installed",
         False,
@@ -1204,15 +1363,6 @@ def install_runtime_bridge(
     )
     original_handle_resume_command: Callable[..., None] | None = (
         _load_original_handle_resume_command(cli_class)
-    )
-    original_compress_context: Callable[..., tuple[object, object]] = (
-        _load_original_compress_context(agent_class)
-    )
-    original_flush_messages_to_session_db: Callable[..., None] | None = (
-        _load_original_flush_messages_to_session_db(agent_class)
-    )
-    original_save_session_log: Callable[..., None] | None = (
-        _load_original_save_session_log(agent_class)
     )
 
     type.__setattr__(
@@ -1240,29 +1390,32 @@ def install_runtime_bridge(
             _build_patched_handle_resume_command(original_handle_resume_command),
         )
     type.__setattr__(
-        agent_class,
-        "_compress_context",
-        _build_patched_compress_context(original_compress_context),
-    )
-    if original_flush_messages_to_session_db is not None:
-        type.__setattr__(
-            agent_class,
-            "_flush_messages_to_session_db",
-            _build_patched_flush_messages_to_session_db(
-                original_flush_messages_to_session_db
-            ),
-        )
-    if original_save_session_log is not None:
-        type.__setattr__(
-            agent_class,
-            "_save_session_log",
-            _build_patched_save_session_log(original_save_session_log),
-        )
-    type.__setattr__(
         cli_class,
         "_operational_checkpoint_bridge_installed",
         True,
     )
+
+
+def _resolve_agent_target(
+    *,
+    run_agent_module: ModuleType | None = None,
+) -> type[AgentBridgeTarget] | None:
+    resolved_run_agent_module: ModuleType | None = (
+        run_agent_module
+        if run_agent_module is not None
+        else sys.modules.get("run_agent")
+    )
+    if resolved_run_agent_module is None:
+        return None
+
+    ai_agent_candidate: object = getattr(
+        resolved_run_agent_module,
+        "AIAgent",
+        None,
+    )
+    if not isinstance(ai_agent_candidate, type):
+        return None
+    return ai_agent_candidate
 
 
 def _resolve_bridge_targets(
@@ -1273,34 +1426,28 @@ def _resolve_bridge_targets(
     resolved_cli_module: ModuleType | None = (
         cli_module if cli_module is not None else sys.modules.get("cli")
     )
-    resolved_run_agent_module: ModuleType | None = (
-        run_agent_module
-        if run_agent_module is not None
-        else sys.modules.get("run_agent")
-    )
-    if resolved_cli_module is None or resolved_run_agent_module is None:
+    if resolved_cli_module is None:
         return None
 
+    ai_agent_candidate: type[AgentBridgeTarget] | None = _resolve_agent_target(
+        run_agent_module=run_agent_module
+    )
     hermes_cli_candidate: object = getattr(
         resolved_cli_module,
         "HermesCLI",
         None,
     )
-    ai_agent_candidate: object = getattr(
-        resolved_run_agent_module,
-        "AIAgent",
-        None,
-    )
-    if not isinstance(hermes_cli_candidate, type) or not isinstance(
-        ai_agent_candidate,
-        type,
-    ):
+    if not isinstance(hermes_cli_candidate, type) or ai_agent_candidate is None:
         return None
 
     return hermes_cli_candidate, ai_agent_candidate
 
 
 def _attempt_sidecar_install() -> bool:
+    ai_agent_class: type[AgentBridgeTarget] | None = _resolve_agent_target()
+    if ai_agent_class is not None:
+        install_agent_runtime_bridge(agent_class=ai_agent_class)
+
     bridge_targets: tuple[type[CLIBridgeTarget], type[AgentBridgeTarget]] | None = (
         _resolve_bridge_targets()
     )
@@ -1308,9 +1455,9 @@ def _attempt_sidecar_install() -> bool:
         return False
 
     hermes_cli_class: type[CLIBridgeTarget]
-    ai_agent_class: type[AgentBridgeTarget]
-    hermes_cli_class, ai_agent_class = bridge_targets
-    install_runtime_bridge(cli_class=hermes_cli_class, agent_class=ai_agent_class)
+    hermes_agent_class: type[AgentBridgeTarget]
+    hermes_cli_class, hermes_agent_class = bridge_targets
+    install_runtime_bridge(cli_class=hermes_cli_class, agent_class=hermes_agent_class)
     return True
 
 
@@ -1353,5 +1500,10 @@ def install_plugin_sidecar() -> None:
     if _attempt_sidecar_install():
         return
 
-    if sys.modules.get("cli") is not None:
-        _schedule_deferred_install()
+    # Hermes can now discover entry-point plugins while only run_agent is
+    # imported. In that ordering, waiting for ``cli`` to already exist drops the
+    # bridge permanently: the context engine registers, but the CLI/manual and
+    # auto-compaction sidecar patches never install. Always schedule the short
+    # deferred probe after an immediate miss so the bridge can attach when the
+    # complementary module finishes importing.
+    _schedule_deferred_install()

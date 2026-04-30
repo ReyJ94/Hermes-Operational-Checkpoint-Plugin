@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Hermes Operational Checkpoint plugin: a continuation-first context engine for long-running tasks"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = ["PyYAML>=6"]
 license = { text = "MIT" }
 authors = [{ name = "ReyJ94" }]
 classifiers = [
@@ -20,6 +21,9 @@ classifiers = [
 
 [project.entry-points."hermes_agent.plugins"]
 operational_checkpoint = "operational_checkpoint"
+
+[project.scripts]
+operational-checkpoint-config = "operational_checkpoint.activation:main"
 
 [tool.setuptools.package-data]
 operational_checkpoint = ["operational_checkpoint.toml"]

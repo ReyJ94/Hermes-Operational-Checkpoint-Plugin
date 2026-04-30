@@ -8,11 +8,31 @@ from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import yaml
+
 import pytest
 
 ROOT: Path = Path(__file__).resolve().parents[1]
 PLUGIN_ENTRYPOINT: Path = ROOT / "__init__.py"
 PluginModules = tuple[ModuleType, ModuleType, ModuleType, ModuleType]
+
+
+def checkpoint_summary(objective: str = "Continue the task") -> str:
+    return "\n\n".join(
+        [
+            f"1. Objective\n- [Observed] {objective}",
+            "2. Explicit user instructions / prohibitions / scope boundaries\nNone.",
+            "3. Operational state\nNone.",
+            "4. Active working set\nNone.",
+            "5. Discoveries / evidence\nNone.",
+            "6. Settled decisions / rejected alternatives\nNone.",
+            "7. Transferable patterns learned this run\nNone.",
+            "8. Assumptions / uncertainties / blockers\nNone.",
+            "9. Execution status\n- Accomplished: None.\n- In progress: None.\n- Remaining: None.",
+            "10. Action frontier\n- [Observed] Run the next probe.",
+            "11. Critical invariants / regression risks\nNone.",
+        ]
+    )
 
 
 def load_plugin_entrypoint() -> ModuleType:
@@ -38,6 +58,77 @@ def plugin_modules() -> PluginModules:
     helpers_module = importlib.import_module("operational_checkpoint.helpers")
     sidecar_module = importlib.import_module("operational_checkpoint.sidecar")
     return entrypoint_module, compressor_module, helpers_module, sidecar_module
+
+
+def test_ensure_plugin_activation_writes_yaml_list_and_context_engine(
+    tmp_path: Path,
+) -> None:
+    from operational_checkpoint.activation import ensure_plugin_activation
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {"enabled": ["disk-cleanup"]},
+                "context": {"engine": "compressor"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    changed = ensure_plugin_activation(config_path)
+
+    assert changed is True
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["plugins"]["enabled"] == ["disk-cleanup", "operational_checkpoint"]
+    assert config["context"]["engine"] == "operational_checkpoint"
+
+
+def test_ensure_plugin_activation_replaces_stringified_enabled_list(
+    tmp_path: Path,
+) -> None:
+    from operational_checkpoint.activation import ensure_plugin_activation
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {"enabled": '["operational_checkpoint"]'},
+                "context": {"engine": "operational_checkpoint"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    changed = ensure_plugin_activation(config_path)
+
+    assert changed is True
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["plugins"]["enabled"] == ["operational_checkpoint"]
+
+
+def test_ensure_plugin_activation_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    from operational_checkpoint.activation import ensure_plugin_activation
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {"enabled": ["operational_checkpoint"]},
+                "context": {"engine": "operational_checkpoint"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    changed = ensure_plugin_activation(config_path)
+
+    assert changed is False
 
 
 def test_registers_context_engine(
@@ -94,6 +185,183 @@ def test_install_plugin_sidecar_defers_when_cli_is_partially_initialized(
     sidecar_module.install_plugin_sidecar()
 
     assert scheduled_calls == ["scheduled"]
+
+
+def test_install_plugin_sidecar_defers_when_discovered_before_cli_import(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    partial_run_agent_module = ModuleType("run_agent")
+    scheduled_calls: list[str] = []
+
+    monkeypatch.delitem(sys.modules, "cli", raising=False)
+    monkeypatch.setitem(sys.modules, "run_agent", partial_run_agent_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "_schedule_deferred_install",
+        lambda: scheduled_calls.append("scheduled"),
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "install_runtime_bridge",
+        lambda **_kwargs: pytest.fail("CLI bridge should not install before HermesCLI exists"),
+    )
+
+    sidecar_module.install_plugin_sidecar()
+
+    assert scheduled_calls == ["scheduled"]
+
+
+def test_install_plugin_sidecar_patches_agent_when_tui_imports_run_agent_without_cli(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    run_agent_module = ModuleType("run_agent")
+    installed_agents: list[type[object]] = []
+    scheduled_calls: list[str] = []
+
+    class FakeAgent:
+        def _compress_context(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[object, object]:
+            del args, kwargs
+            return [], ""
+
+    run_agent_module.AIAgent = FakeAgent
+    monkeypatch.delitem(sys.modules, "cli", raising=False)
+    monkeypatch.setitem(sys.modules, "run_agent", run_agent_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "install_agent_runtime_bridge",
+        lambda *, agent_class: installed_agents.append(agent_class),
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "install_runtime_bridge",
+        lambda **_kwargs: pytest.fail("CLI bridge should not install before HermesCLI exists"),
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "_schedule_deferred_install",
+        lambda: scheduled_calls.append("scheduled"),
+    )
+
+    sidecar_module.install_plugin_sidecar()
+    assert installed_agents == [FakeAgent]
+    assert scheduled_calls == ["scheduled"]
+
+
+def test_agent_runtime_bridge_refreshes_tui_usage_after_response_usage_update(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    tui_module = ModuleType("tui_gateway.server")
+    emitted: list[tuple[str, str, dict[str, object]]] = []
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.compression_count = 0
+            self.context_length = 400_000
+            self.hermes_home = None
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def update_from_response(self, usage: dict[str, object]) -> None:
+            self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            del callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return False
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del current_tokens, focus_topic
+            return messages
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.platform = "tui"
+            self.session_id = "session-live"
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del runtime_kwargs
+            return messages, system_message
+
+    def emit(event: str, sid: str, payload: dict[str, object]) -> None:
+        emitted.append((event, sid, payload))
+
+    def session_info(agent: object) -> dict[str, object]:
+        engine = getattr(agent, "context_compressor")
+        return {
+            "usage": {
+                "context_used": engine.last_prompt_tokens,
+                "context_max": engine.context_length,
+                "context_percent": round(engine.last_prompt_tokens / engine.context_length * 100),
+            }
+        }
+
+    tui_module._emit = emit
+    tui_module._session_info = session_info
+    tui_module._sessions = {}
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", tui_module)
+
+    sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
+    agent = FakeAgent()
+    tui_module._sessions = {"sid-live": {"agent": agent}}
+
+    agent.context_compressor.update_from_response(
+        {"prompt_tokens": 252_000, "completion_tokens": 1_000, "total_tokens": 253_000}
+    )
+
+    assert agent.context_compressor.bound_session_id == "session-live"
+    assert emitted == [
+        (
+            "session.info",
+            "sid-live",
+            {"usage": {"context_used": 252_000, "context_max": 400_000, "context_percent": 63}},
+        )
+    ]
+
 
 
 def test_install_plugin_sidecar_installs_when_targets_are_ready(
@@ -203,10 +471,7 @@ def test_prompt_uses_operational_checkpoint_sections(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            "Objective\n- Continue the task\n\n"
-                            "Action frontier\n- Run the next probe"
-                        )
+                        content=checkpoint_summary("Continue the task")
                     )
                 )
             ]
@@ -230,6 +495,84 @@ def test_prompt_uses_operational_checkpoint_sections(
     assert "FOCUS TOPIC: adapter failure" in prompt
     assert result is not None
     assert result.startswith(compressor_module.SUMMARY_PREFIX)
+
+
+def test_generate_summary_rejects_malformed_six_section_checkpoint_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 175_000,
+            "base_url": "",
+            "config_context_length": 200_000,
+            "context_limit_tokens": 200_000,
+            "head_preserve_messages": 2,
+            "minimum_tail_messages": 3,
+            "model": "gpt-5.4-mini",
+            "provider": "openai-codex",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 18_000,
+        },
+    )
+    malformed = (
+        "1. Objective\n- [Observed] Continue\n\n"
+        "2. Explicit user instructions / prohibitions / scope boundaries\nNone.\n\n"
+        "3. Operational state\nNone.\n\n"
+        "4. Active working set\nNone.\n\n"
+        "5. Discoveries / evidence\nNone.\n\n"
+        "6. Settled decisions / rejected alternatives\n"
+        "- [Settled? invalid label prohibited] None.\n"
+        "Need only allowed labels. Must avoid \"Settled?\" label. Rewrite section with allowed labels."
+    )
+    responses = iter([malformed, checkpoint_summary("valid retry")])
+    attempts: list[str] = []
+
+    def fake_call_llm(
+        *,
+        task: str | None,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        messages: list[dict[str, str]],
+        max_tokens: int | None,
+        extra_body: dict[str, object] | None = None,
+        main_runtime: dict[str, object] | None = None,
+    ) -> object:
+        del provider, model, base_url, api_key, task, messages, max_tokens, extra_body, main_runtime
+        content = next(responses)
+        attempts.append(content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    result = engine._generate_summary([{"role": "user", "content": "compress me"}])
+
+    assert result is not None
+    assert len(attempts) == 2
+    assert "7. Transferable patterns learned this run" in result
+    assert "[Settled? invalid label prohibited]" not in result
+    assert engine.last_checkpoint_summary.startswith("1. Objective\n- [Observed] valid retry")
+
+
+def test_fallback_checkpoint_preserves_canonical_eleven_section_shape(
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    body = compressor_module.OperationalCheckpointCompressor._fallback_checkpoint_body(7)
+
+    for index, section_title in enumerate(compressor_module._REQUIRED_CHECKPOINT_SECTIONS, start=1):
+        assert f"{index}. {section_title}" in body
+    assert not compressor_module.OperationalCheckpointCompressor._summary_validation_errors(body)
+    assert "7 earlier turns were compacted" in body
 
 
 def test_runtime_defaults_drive_threshold_shape(
@@ -323,8 +666,8 @@ def test_compress_uses_plugin_owned_checkpoint_assembly_and_updates_previous_sum
     prompts: list[str] = []
     summaries = iter(
         [
-            "Objective\n- first checkpoint\n\nAction frontier\n- next probe",
-            "Objective\n- updated checkpoint\n\nAction frontier\n- continue",
+            checkpoint_summary("first checkpoint"),
+            checkpoint_summary("updated checkpoint"),
         ]
     )
 
@@ -390,9 +733,9 @@ def test_compress_uses_plugin_owned_checkpoint_assembly_and_updates_previous_sum
     ]
     assert engine.compression_count == 2
     assert len(checkpoint_messages_twice) == 1
-    assert "PREVIOUS CHECKPOINT:\nObjective\n- first checkpoint" in prompts[1]
+    assert "PREVIOUS CHECKPOINT:\n1. Objective\n- [Observed] first checkpoint" in prompts[1]
     assert "NEW TURNS TO INCORPORATE:" in prompts[1]
-    assert engine.last_checkpoint_summary.startswith("Objective\n- updated checkpoint")
+    assert engine.last_checkpoint_summary.startswith("1. Objective\n- [Observed] updated checkpoint")
 
 
 def test_compress_inserts_plugin_owned_fallback_checkpoint_when_summary_fails(
@@ -815,6 +1158,37 @@ def test_runtime_defaults_match_actual_plugin_toml(
     assert engine.reasoning_effort == "medium"
 
 
+def test_update_model_keeps_plugin_summary_model_separate_from_main_runtime(
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.update_model(
+        "gpt-5.5",
+        context_length=272_000,
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex/",
+        api_key="***",
+        api_mode="codex_responses",
+    )
+    request = engine._build_summary_request(
+        [{"role": "user", "content": "summarize me"}],
+        focus_topic=None,
+    )
+
+    assert engine.model == "gpt-5.4-mini"
+    assert request.model == "gpt-5.4-mini"
+    assert request.provider == "openai-codex"
+    assert request.main_runtime == {
+        "api_key": "***",
+        "api_mode": "codex_responses",
+        "base_url": "https://chatgpt.com/backend-api/codex/",
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+    }
+
+
 def test_load_plugin_root_config_falls_back_to_packaged_config(
     monkeypatch: pytest.MonkeyPatch,
     plugin_modules: PluginModules,
@@ -951,10 +1325,7 @@ def test_generate_summary_passes_current_runtime_to_auxiliary_llm(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            "Objective\n- Continue the task\n\n"
-                            "Action frontier\n- Run the next discriminating probe"
-                        )
+                        content=checkpoint_summary("Continue the task")
                     )
                 )
             ]
@@ -978,7 +1349,7 @@ def test_generate_summary_passes_current_runtime_to_auxiliary_llm(
 
     assert captured["task"] == "compression"
     assert captured["provider"] == "custom"
-    assert captured["model"] == "runtime-model"
+    assert captured["model"] == "gpt-5.4"
     assert captured["base_url"] == "http://127.0.0.1:8765/v1"
     assert captured["api_key"] == "dummy-key"
     assert captured["main_runtime"] == {
@@ -1036,7 +1407,7 @@ def test_generate_summary_infers_custom_provider_from_base_url(
         captured["api_key"] = api_key
         captured["main_runtime"] = main_runtime
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=checkpoint_summary("Continue")))]
         )
 
     monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
@@ -1107,7 +1478,7 @@ def test_generate_summary_explicit_runtime_overrides_upstream_auxiliary_compress
         captured["api_key"] = api_key
         captured["main_runtime"] = main_runtime
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=checkpoint_summary("Continue")))]
         )
 
     monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
@@ -1178,7 +1549,7 @@ def test_generate_summary_does_not_force_codex_base_url_as_custom_endpoint(
         captured["api_key"] = api_key
         captured["main_runtime"] = main_runtime
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Objective\n- Continue"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=checkpoint_summary("Continue")))]
         )
 
     monkeypatch.setattr(compressor_module, "call_llm", fake_call_llm)
@@ -1383,10 +1754,7 @@ def test_compress_allows_zero_head_and_tail_and_summarizes_full_window(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            "Objective\n- compact the whole working view\n\n"
-                            "Action frontier\n- continue from the checkpoint"
-                        )
+                        content=checkpoint_summary("compact the whole working view")
                     )
                 )
             ]
@@ -1459,10 +1827,7 @@ def test_zero_minimum_tail_still_respects_positive_tail_token_budget(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            "Objective\n- keep a raw tail\n\n"
-                            "Action frontier\n- continue from the preserved tail"
-                        )
+                        content=checkpoint_summary("keep a raw tail")
                     )
                 )
             ]
@@ -1859,7 +2224,7 @@ def test_sidecar_manual_compress_keeps_same_session_and_preserves_raw_upstream_t
         ) -> list[dict[str, object]]:
             del messages, current_tokens
             self.compression_count += 1
-            self.last_checkpoint_summary = "Objective\n- stay on this session"
+            self.last_checkpoint_summary = checkpoint_summary("stay on this session")
             if self.callback is not None:
                 self.callback(
                     {
@@ -2183,10 +2548,7 @@ def test_auto_preflight_compaction_continues_turn(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            "Objective\n- Preserve operational state\n\n"
-                            "Action frontier\n- Continue after compaction"
-                        )
+                        content=checkpoint_summary("Preserve operational state")
                     )
                 )
             ]
@@ -2209,7 +2571,6 @@ def test_auto_preflight_compaction_continues_turn(
                     max_iterations=4,
                     enabled_toolsets=[],
                     quiet_mode=True,
-                    persist_session=False,
                 )
                 super().__init__(*args, **kwargs)
                 self._cleanup_task_resources = lambda *a, **k: None
@@ -2269,7 +2630,7 @@ def test_auto_preflight_compaction_continues_turn(
 
         assert agent.context_compressor.name == "operational_checkpoint"
         assert agent.context_compressor.compression_count == 1
-        assert agent.context_compressor.last_checkpoint_summary.startswith("Objective")
+        assert agent.context_compressor.last_checkpoint_summary.startswith("1. Objective")
         assert agent.session_id == original_session_id
         assert result["final_response"] == "continued after compaction"
     finally:

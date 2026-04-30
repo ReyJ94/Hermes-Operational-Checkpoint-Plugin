@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,23 @@ _MINIMUM_MESSAGES_TO_COMPACT: int = 1
 _CHECKPOINT_SEPARATOR: str = (
     "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
 )
+_REQUIRED_CHECKPOINT_SECTIONS: tuple[str, ...] = (
+    "Objective",
+    "Explicit user instructions / prohibitions / scope boundaries",
+    "Operational state",
+    "Active working set",
+    "Discoveries / evidence",
+    "Settled decisions / rejected alternatives",
+    "Transferable patterns learned this run",
+    "Assumptions / uncertainties / blockers",
+    "Execution status",
+    "Action frontier",
+    "Critical invariants / regression risks",
+)
+_ALLOWED_EPISTEMIC_LABELS: frozenset[str] = frozenset(
+    {"Observed", "Inferred", "Assumption", "Unknown", "Blocked"}
+)
+_BRACKETED_LABEL_RE: re.Pattern[str] = re.compile(r"\[([^\]]+)\]")
 
 
 class ToolCallFunction(TypedDict, total=False):
@@ -188,6 +206,11 @@ class OperationalCheckpointCompressor(ContextEngine):
     protect_last_n: int
     provider: str
     reasoning_effort: str
+    runtime_api_key: str
+    runtime_api_mode: str
+    runtime_base_url: str
+    runtime_model: str
+    runtime_provider: str
     summary_retry_attempts: int
     tail_preserve_tokens: int
     tail_token_budget: int
@@ -216,6 +239,11 @@ class OperationalCheckpointCompressor(ContextEngine):
         self.base_url = ""
         self.model = ""
         self.provider = ""
+        self.runtime_api_key = ""
+        self.runtime_api_mode = ""
+        self.runtime_base_url = ""
+        self.runtime_model = ""
+        self.runtime_provider = ""
         self.reasoning_effort = ""
         self.auto_compact_at_tokens = 0
         self.context_length = 0
@@ -307,6 +335,86 @@ class OperationalCheckpointCompressor(ContextEngine):
                 text = text[len(prefix) :].lstrip()
                 break
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+
+    @staticmethod
+    def _canonical_section_line(index: int, title: str) -> str:
+        return f"{index}. {title}"
+
+    @classmethod
+    def _summary_validation_errors(cls, summary: str) -> list[str]:
+        text: str = (summary or "").strip()
+        if not text:
+            return ["summary is empty"]
+
+        errors: list[str] = []
+        search_start: int = 0
+        section_index: int
+        section_title: str
+        for section_index, section_title in enumerate(_REQUIRED_CHECKPOINT_SECTIONS, start=1):
+            canonical_heading: str = cls._canonical_section_line(section_index, section_title)
+            heading_position: int = text.find(canonical_heading, search_start)
+            if heading_position < 0:
+                errors.append(f"missing section: {canonical_heading}")
+                continue
+            search_start = heading_position + len(canonical_heading)
+
+        raw_label: str
+        for raw_label in _BRACKETED_LABEL_RE.findall(text):
+            normalized_label: str = raw_label.strip()
+            if normalized_label and normalized_label not in _ALLOWED_EPISTEMIC_LABELS:
+                errors.append(f"invalid epistemic label: [{normalized_label}]")
+
+        return errors
+
+    @classmethod
+    def _fallback_section_body(cls, section_index: int) -> str:
+        if section_index == 1:
+            return "- [Observed] Continue from the recent tail after compaction."
+        if section_index == 3:
+            return "- [Observed] Summary generation was unavailable."
+        if section_index == 5:
+            return "- [Observed] Earlier turns were compacted without a full LLM-generated checkpoint."
+        if section_index == 8:
+            return (
+                "- [Unknown] The compacted middle-turn state was not summarized by "
+                "the LLM; re-verify critical assumptions from repo/runtime state."
+            )
+        if section_index == 9:
+            return (
+                "- Accomplished: [Observed] Compaction completed with plugin-owned "
+                "fallback checkpoint.\n"
+                "- In progress: [Unknown] Exact state from compacted middle turns.\n"
+                "- Remaining: [Observed] Continue from recent messages and inspect "
+                "live artifacts before acting on old assumptions."
+            )
+        if section_index == 10:
+            return (
+                "- [Observed] Continue from the recent messages below and verify "
+                "state from repo/runtime before redoing work."
+            )
+        if section_index == 11:
+            return (
+                "- [Observed] Treat this fallback checkpoint as incomplete; do not "
+                "rely on it for decisions that need exact compacted-turn evidence."
+            )
+        return "None."
+
+    @classmethod
+    def _fallback_checkpoint_body(cls, dropped_turn_count: int) -> str:
+        sections: list[str] = []
+        section_index: int
+        section_title: str
+        for section_index, section_title in enumerate(_REQUIRED_CHECKPOINT_SECTIONS, start=1):
+            body: str = cls._fallback_section_body(section_index)
+            if section_index == 5:
+                body += (
+                    f"\n- [Observed] {dropped_turn_count} earlier turns were compacted "
+                    "without a full structured checkpoint."
+                )
+            sections.append(
+                f"{cls._canonical_section_line(section_index, section_title)}\n{body}"
+            )
+        return "\n\n".join(sections)
 
     def _snapshot_payload(self) -> dict[str, object]:
         total_tokens: int = self.last_total_tokens
@@ -424,9 +532,14 @@ class OperationalCheckpointCompressor(ContextEngine):
         api_key: str = string_or_empty(runtime_config.get("api_key"))
         api_mode: str = string_or_empty(runtime_config.get("api_mode"))
         self._reload_from_config(
-            model_override=model,
+            model_override=None,
             provider_override=provider_override,
         )
+        self.runtime_model = string_or_empty(model).strip()
+        self.runtime_provider = provider_override
+        self.runtime_base_url = base_url
+        self.runtime_api_key = api_key
+        self.runtime_api_mode = api_mode
         self.base_url = base_url
         self.api_key = api_key
         self.api_mode = api_mode
@@ -545,6 +658,15 @@ class OperationalCheckpointCompressor(ContextEngine):
                         self.summary_retry_attempts,
                     )
                     continue
+                validation_errors: list[str] = self._summary_validation_errors(summary_body)
+                if validation_errors:
+                    logger.warning(
+                        "operational checkpoint summary attempt %d/%d failed schema validation: %s",
+                        attempt_index + 1,
+                        self.summary_retry_attempts,
+                        "; ".join(validation_errors[:5]),
+                    )
+                    continue
                 summary_tokens_estimate: int = estimate_tokens(summary_body)
                 self.last_checkpoint_focus_topic = focus_topic
                 self.last_checkpoint_summary = summary_body
@@ -624,13 +746,18 @@ class OperationalCheckpointCompressor(ContextEngine):
             explicit_base_url = self.base_url or None
             explicit_api_key = self.api_key or None
         main_runtime: dict[str, object] | None = None
-        if any((self.model, provider_name, self.base_url, self.api_key, self.api_mode)):
+        runtime_model: str = self.runtime_model or self.model
+        runtime_provider: str = self.runtime_provider or provider_name
+        runtime_base_url: str = self.runtime_base_url or self.base_url
+        runtime_api_key: str = self.runtime_api_key or self.api_key
+        runtime_api_mode: str = self.runtime_api_mode or self.api_mode
+        if any((runtime_model, runtime_provider, runtime_base_url, runtime_api_key, runtime_api_mode)):
             main_runtime = {
-                "model": self.model,
-                "provider": provider_name,
-                "base_url": self.base_url,
-                "api_key": self.api_key,
-                "api_mode": self.api_mode,
+                "model": runtime_model,
+                "provider": runtime_provider,
+                "base_url": runtime_base_url,
+                "api_key": runtime_api_key,
+                "api_mode": runtime_api_mode,
             }
         return SummaryRequest(
             api_key=explicit_api_key,
@@ -747,13 +874,7 @@ class OperationalCheckpointCompressor(ContextEngine):
         )
 
     def _fallback_checkpoint(self, dropped_turn_count: int) -> str:
-        summary_body: str = (
-            f"Objective\n- Continue from the recent tail after compaction\n\n"
-            f"Operational state\n- Summary generation was unavailable\n"
-            f"- {dropped_turn_count} earlier turns were compacted without a full structured checkpoint\n\n"
-            "Action frontier\n- Continue from the recent messages below and verify state from the repo/runtime before redoing work\n\n"
-            "Critical invariants / regression risks\n- Treat the checkpoint as incomplete and re-verify critical assumptions from current state\n"
-        )
+        summary_body: str = self._fallback_checkpoint_body(dropped_turn_count)
         self.last_checkpoint_focus_topic = None
         self.last_checkpoint_summary = summary_body.strip()
         self._previous_summary = self.last_checkpoint_summary

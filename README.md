@@ -2,30 +2,142 @@
 
 ![Hermes Operational Checkpoint Plugin banner](./Operational-Checkpoint.jpg)
 
-Operational Checkpoint is a compression plugin for Hermes for sessions that go on long enough that a normal summary starts to feel a little too soft around the edges.
+Operational Checkpoint keeps long Hermes sessions usable after compression.
 
-Hermes already has auto-compression. This plugin is not trying to replace that idea with something completely different. It is trying to make the continuation after compression feel more solid when the session has a lot of real state in it: decisions that were already made, constraints that were discovered along the way, failed paths that should not be retried, and a clear sense of what the next move should be.
+Normal summaries are fine when you only need the gist. They are not fine when a session is carrying real work: decisions, constraints, failed paths, active files, evidence, risks, and the next move. Lose those, and the model does not continue the work. It starts reconstructing it.
 
-That is really the whole point of this project. On long technical sessions, it is often not enough for the model to remember the general topic. What matters is whether it can continue the work without blurring what was actually learned.
+This plugin turns compression into an operational checkpoint. The goal is not a nicer recap. The goal is that the next turn still knows what is going on.
 
-Operational Checkpoint leans into that. Instead of treating compression as a broad recap, it writes a denser checkpoint meant to carry the work forward. The emphasis is on continuity: what is true, what changed, what matters now, and what should happen next.
+Use it for long debugging runs, codebase surgery, research threads, multi-step implementation, and agent work that may compact more than once.
 
-It is especially useful for long debugging runs, deep codebase work, multi-step implementation, research sessions, and agent runs that may compact more than once. In those cases, the difference between “the model kind of remembers” and “the session still has a strong working state” becomes very noticeable.
+What you get:
 
-Compared with Hermes' native compression, this plugin currently gives you a few specific things:
+- dense continuation state instead of a soft summary
+- same-session compression instead of a child-session handoff
+- checkpoint validation, so malformed summaries do not quietly become memory
+- safe fallback checkpoints when summary generation fails
+- CLI/TUI hooks for manual compression, auto-compaction, resume, save, hydration, and usage display
+- a helper command that activates the plugin with real YAML, not a config value that only looks right
 
-- a denser continuation checkpoint instead of a broader handoff-style summary
-- same-session compression instead of moving the work onto a child continuation session
-- plugin-owned checkpoint runtime selection, so compression is not quietly steered by upstream auxiliary compression defaults
-- full-window checkpointing by default, rather than preserving raw head and tail anchors unless you opt into that
-- plugin-owned auto-compression and manual compression status lines that talk about context-budget reduction instead of message-count reduction
-- checkpointed continuity layered over retained raw history, so the live session stays tighter without pretending the old history disappeared
+## Why this became more than one hook
 
-Once you enable `context.engine: operational_checkpoint`, this plugin becomes the active compression engine for the session. It changes when auto-compression triggers, how manual compression behaves, what gets compressed, how the checkpointed state is written, how that state is resumed later, and how compression shows up in the CLI.
+Hermes gives plugins a context-engine hook. That is the right doorway, but it is not the whole room.
 
-The behavior is intentionally simple. It uses explicit token thresholds, keeps compression on the active session, and gives you checkpointed continuity over retained history. The live working view is compressed, but the raw session history is still kept separately. By default it checkpoints the full compression window instead of preserving a raw head or tail.
+A hook can register a compressor. It cannot, by itself, make sure Hermes actually loads the plugin, that `/compress` and auto-compaction hit the same path, that the work stays in the same session, that resumed sessions hydrate the checkpoint correctly, or that the TUI stops showing stale usage after compaction.
 
-The shipped defaults look like this:
+So this repo reaches into the real runtime boundary: activation, sidecar hooks, CLI/TUI paths, resume, save, hydration, checkpoint validation, and fallback shape. Without that, Operational Checkpoint would be a nice engine class that only works when Hermes enters through the happy path.
+
+That is not the goal. The goal is continuity that survives real sessions. Compression should make the active context smaller without sanding off the operational state of the work.
+
+## How it works
+
+When `context.engine: operational_checkpoint` is active, this plugin becomes the compression engine for the session.
+
+It writes an 11-section checkpoint focused on continuation:
+
+1. Objective
+2. Explicit user instructions / prohibitions / scope boundaries
+3. Operational state
+4. Active working set
+5. Discoveries / evidence
+6. Settled decisions / rejected alternatives
+7. Transferable patterns learned this run
+8. Assumptions / uncertainties / blockers
+9. Execution status
+10. Action frontier
+11. Critical invariants / regression risks
+
+The checkpoint uses explicit epistemic labels:
+
+- `[Observed]`
+- `[Inferred]`
+- `[Assumption]`
+- `[Unknown]`
+- `[Blocked]`
+
+That structure is deliberate. It keeps the checkpoint from turning into prose. A continuation model needs state, evidence, boundaries, and next action. It does not need a bedtime story about the session.
+
+Operational Checkpoint also owns its checkpoint-generation runtime, so compression is not quietly steered by upstream auxiliary compression defaults. Changing the main chat model should not accidentally change how checkpointing behaves.
+
+By default, the plugin checkpoints the full compression window. It does not preserve raw head or tail anchors unless you opt into that. Raw history is still retained separately; the active working view gets tighter.
+
+## Install
+
+Install from GitHub into the Hermes virtualenv and activate it:
+
+```bash
+uv pip install \
+  --python ~/.hermes/hermes-agent/venv/bin/python \
+  "git+https://github.com/ReyJ94/Hermes-Operational-Checkpoint-Plugin.git" && \
+  ~/.hermes/hermes-agent/venv/bin/operational-checkpoint-config
+```
+
+If you do not use `uv`:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/pip install \
+  "git+https://github.com/ReyJ94/Hermes-Operational-Checkpoint-Plugin.git" && \
+  ~/.hermes/hermes-agent/venv/bin/operational-checkpoint-config
+```
+
+The helper writes the activation state Hermes actually needs:
+
+```yaml
+plugins:
+  enabled:
+    - operational_checkpoint
+context:
+  engine: operational_checkpoint
+```
+
+Do not activate the plugin with this:
+
+```bash
+hermes config set plugins.enabled '["operational_checkpoint"]'
+```
+
+On current Hermes builds that can write a string instead of a YAML list. The config then looks plausible, but plugin loading still skips the entry-point plugin. The helper exists because that bug is easy to miss and annoying to diagnose.
+
+For a non-default config path:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/operational-checkpoint-config \
+  --config ~/.hermes/profiles/<profile-name>/config.yaml
+```
+
+The helper only activates the plugin. It does not change model context length, thresholds, providers, or compression-budget defaults.
+
+## Local development install
+
+From a local checkout:
+
+```bash
+cd /path/to/operational-checkpoint
+uv build --wheel --out-dir dist
+uv pip install \
+  --python ~/.hermes/hermes-agent/venv/bin/python \
+  --force-reinstall \
+  dist/operational_checkpoint-*.whl && \
+  ~/.hermes/hermes-agent/venv/bin/operational-checkpoint-config
+```
+
+Plain `pip` works too:
+
+```bash
+cd /path/to/operational-checkpoint
+python -m pip install build
+python -m build --wheel --out-dir dist
+~/.hermes/hermes-agent/venv/bin/pip install \
+  --force-reinstall \
+  dist/operational_checkpoint-*.whl && \
+  ~/.hermes/hermes-agent/venv/bin/operational-checkpoint-config
+```
+
+After local edits, rebuild and reinstall before testing against Hermes. Hermes will not pick up source changes from this checkout until the installed wheel is refreshed.
+
+## Defaults
+
+The shipped defaults live in `operational_checkpoint.toml`:
 
 ```toml
 [defaults]
@@ -37,62 +149,14 @@ auto_compact_at_tokens = 350000
 head_preserve_messages = 0
 minimum_tail_messages = 0
 tail_preserve_tokens = 0
+
+[cli]
+emit_compaction_status = true
+show_summary_preview = false
+summary_preview_chars = 160
 ```
 
-If you want head or tail protection, those settings still exist. They are just not the default anymore.
-
-## Install
-
-The easiest install is a single shell line from GitHub:
-
-```bash
-uv pip install \
-  --python ~/.hermes/hermes-agent/venv/bin/python \
-  "git+https://github.com/ReyJ94/Hermes-Operational-Checkpoint-Plugin.git" && \
-  hermes config set context.engine operational_checkpoint
-```
-
-That installs the plugin into the Hermes virtualenv and enables it as the active context engine in one shot.
-
-If you do not use `uv`, the plain `pip` version is:
-
-```bash
-~/.hermes/hermes-agent/venv/bin/pip install \
-  "git+https://github.com/ReyJ94/Hermes-Operational-Checkpoint-Plugin.git" && \
-  hermes config set context.engine operational_checkpoint
-```
-
-If you are installing from a local checkout instead, use the source install path:
-
-```bash
-cd /path/to/operational-checkpoint
-uv build --wheel --out-dir dist
-uv pip install \
-  --python ~/.hermes/hermes-agent/venv/bin/python \
-  --force-reinstall \
-  dist/operational_checkpoint-*.whl && \
-  hermes config set context.engine operational_checkpoint
-```
-
-If you prefer plain `pip` for a local checkout:
-
-```bash
-cd /path/to/operational-checkpoint
-python -m pip install build
-python -m build --wheel --out-dir dist
-~/.hermes/hermes-agent/venv/bin/pip install \
-  --force-reinstall \
-  dist/operational_checkpoint-*.whl && \
-  hermes config set context.engine operational_checkpoint
-```
-
-After that, start Hermes normally with `hermes`.
-
-If you later update a local source checkout, rebuild and reinstall before testing again. Hermes will not pick up local source edits from this repo unless the installed wheel is refreshed.
-
-## Configuration
-
-Plugin defaults live in `operational_checkpoint.toml`. Hermes config can still override threshold and CLI behavior if you want to tune them:
+Hermes config can override them:
 
 ```yaml
 operational_checkpoint:
@@ -108,24 +172,28 @@ operational_checkpoint:
     summary_preview_chars: 160
 ```
 
-One important detail: the plugin now owns its own checkpoint-generation runtime. In practice that means plugin compression no longer depends on upstream `auxiliary.compression.*` defaults leaking into the summary call.
+If you want head or tail protection, set those values explicitly. The default is full-window checkpointing because this plugin treats the compression window as the thing to preserve.
 
-## What It Looks Like
+## What it looks like
 
-When auto-compression happens, the plugin can emit status lines like this:
+During auto-compaction, you may see:
 
 ```text
 🗜️  Operational Checkpoint: auto-compacting ~123,456 / 350,000 tokens...
   ✅ Operational Checkpoint reduced active context budget: ~123,456 → ~18,200 tokens
 ```
 
-That wording is deliberate. For this plugin, the meaningful thing is the reduction in active context budget, not a message-count story that can be misleading once the session is being checkpointed and hydrated.
+The wording is intentional. Message counts become misleading once checkpointing and hydration are involved. The useful number is how much active context budget was reduced.
 
-## Quick Check
+## Quick check
 
-Inside Hermes, run `/plugins` and make sure `operational_checkpoint` is enabled.
+Inside Hermes:
 
-Then try something simple:
+```text
+/plugins
+```
+
+Make sure `operational_checkpoint` is enabled. Then try a small manual compression:
 
 ```text
 /clear
@@ -133,26 +201,17 @@ say a few things
 /compress
 ```
 
-If the plugin is active, manual compression should work normally, and auto-compression should use the plugin-owned status lines as well.
+If the plugin is active, manual compression should run through Operational Checkpoint. Auto-compaction should use the same checkpoint path and status wording.
 
 ## Development
 
-If you are developing the plugin itself, tests run against the Hermes virtualenv:
+Run the test suite with the Hermes virtualenv:
 
 ```bash
 /home/reyj94/.hermes/hermes-agent/venv/bin/python -m pytest -q
 ```
 
-If you want to test the real installed path again:
-
-```bash
-cd /path/to/operational-checkpoint
-uv build --wheel --out-dir dist
-uv pip install \
-  --python ~/.hermes/hermes-agent/venv/bin/python \
-  --force-reinstall \
-  dist/operational_checkpoint-*.whl
-```
+The tests cover activation config writing, deferred sidecar installation, TUI usage refresh, checkpoint shape validation, runtime separation, full-window compression defaults, same-session manual compression, resume hydration, and auto preflight compaction.
 
 ## License
 
