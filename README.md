@@ -185,6 +185,15 @@ During auto-compaction, you may see:
 
 The wording is intentional. Message counts become misleading once checkpointing and hydration are involved. The useful number is how much active context budget was reduced.
 
+## Tested Hermes versions
+
+This plugin has been tested against:
+
+- Hermes Agent v0.11.0 (2026.4.23)
+- local Hermes source checkout on `main` at `9a1454060` from 2026-04-30
+
+It may work on nearby Hermes builds, but this plugin touches runtime boundaries that can change: CLI/TUI import order, context-engine registration, manual `/compress`, auto-compaction, resume, save, hydration, and usage reporting. If those internals move, rerun the tests before trusting it.
+
 ## Quick check
 
 Inside Hermes:
