@@ -643,6 +643,161 @@ def test_tui_prompt_submit_uses_compacted_active_history_without_replacing_visib
 
 
 
+def test_tui_stream_usage_preserves_in_flight_tool_context(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, helpers_module, sidecar_module = plugin_modules
+    tui_module = ModuleType("tui_gateway.server")
+    emitted: list[tuple[str, str, dict[str, object]]] = []
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.compression_count = 1
+            self.context_length = 400_000
+            self.hermes_home = None
+            self.last_checkpoint_summary = "summary"
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def update_from_response(self, usage: dict[str, object]) -> None:
+            self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            del callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return False
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del current_tokens, focus_topic
+            return messages
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.platform = "tui"
+            self.session_id = "session-live"
+            self._cached_system_prompt = "system"
+            self.tools = []
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del runtime_kwargs
+            return messages, system_message
+
+        def run_conversation(
+            self,
+            user_message: str,
+            system_message: str | None = None,
+            conversation_history: list[dict[str, object]] | None = None,
+            stream_callback: Callable[[str], object] | None = None,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            del system_message, kwargs
+            seen = list(conversation_history or [])
+            self.tool_start_callback("call-1", "terminal", {"command": "pytest"})
+            self.tool_complete_callback("call-1", "terminal", {}, "tool output")
+            if stream_callback is not None:
+                stream_callback("assistant streaming text")
+            return {
+                "final_response": "done",
+                "messages": seen
+                + [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": "", "tool_calls": []},
+                    {"role": "tool", "content": "tool output", "tool_call_id": "call-1"},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+
+    def emit(event: str, sid: str, payload: dict[str, object]) -> None:
+        emitted.append((event, sid, payload))
+
+    def session_info(agent: object) -> dict[str, object]:
+        engine = getattr(agent, "context_compressor")
+        return {"usage": {"context_used": engine.last_prompt_tokens}}
+
+    tui_module._emit = emit
+    tui_module._session_info = session_info
+    tui_module._sessions = {}
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", tui_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "estimate_request_tokens_rough",
+        lambda messages, *, system_prompt="", tools=None: len(messages) * 100 + len(system_prompt),
+    )
+    monkeypatch.setattr(sidecar_module, "_LIVE_STREAM_USAGE_MIN_CHARS", 1)
+    monkeypatch.setattr(sidecar_module, "_LIVE_STREAM_USAGE_MIN_INTERVAL_SECONDS", 0.0)
+
+    sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
+    agent = FakeAgent()
+    raw_history = [{"role": "user", "content": f"raw-{index}"} for index in range(12)]
+    record = helpers_module.PersistedCompactionState(
+        compacted_messages=[{"role": "assistant", "content": "checkpoint"}],
+        compression_count=1,
+        focus_topic=None,
+        raw_message_count=20,
+        summary="summary",
+        tokens_after=100,
+        tokens_before=1000,
+        updated_at=123.0,
+    )
+    sidecar_module._set_active_compaction_state(agent=agent, record=record)
+    tui_module._sessions = {
+        "sid-live": {
+            "agent": agent,
+            "history": raw_history,
+        }
+    }
+
+    agent.run_conversation(
+        "new",
+        conversation_history=list(raw_history),
+        stream_callback=lambda delta: None,
+    )
+
+    assert emitted == [
+        ("session.info", "sid-live", {"usage": {"context_used": 206}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 306}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 406}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 506}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 506}}),
+    ]
+
+
+
 def test_tui_hydration_uses_compacted_fallback_when_checkpoint_is_ahead_of_history(
     plugin_modules: PluginModules,
     monkeypatch: pytest.MonkeyPatch,

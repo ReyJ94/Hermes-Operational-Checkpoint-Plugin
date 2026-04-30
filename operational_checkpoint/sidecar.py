@@ -1708,6 +1708,12 @@ def _build_patched_run_conversation(
         )
         _emit_tui_usage_update(self)
 
+        live_tool_messages: list[dict[str, object]] = _copy_message_list(in_flight_messages)
+        live_tool_lock: threading.Lock = threading.Lock()
+        assistant_tool_message_index: int | None = None
+        original_tool_start_callback: object = getattr(self, "tool_start_callback", None)
+        original_tool_complete_callback: object = getattr(self, "tool_complete_callback", None)
+
         stream_callback: object = kwargs.get("stream_callback")
         if callable(stream_callback):
             kwargs = {
@@ -1716,15 +1722,9 @@ def _build_patched_run_conversation(
                     agent=self,
                     engine=engine,
                     stream_callback=stream_callback,
-                    base_messages=in_flight_messages,
+                    base_messages=live_tool_messages,
                 ),
             }
-
-        live_tool_messages: list[dict[str, object]] = _copy_message_list(in_flight_messages)
-        live_tool_lock: threading.Lock = threading.Lock()
-        assistant_tool_message_index: int | None = None
-        original_tool_start_callback: object = getattr(self, "tool_start_callback", None)
-        original_tool_complete_callback: object = getattr(self, "tool_complete_callback", None)
 
         def emit_live_tool_usage() -> None:
             _refresh_context_token_state(
