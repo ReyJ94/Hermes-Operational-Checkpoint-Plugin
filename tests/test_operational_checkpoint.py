@@ -609,7 +609,7 @@ def test_tui_prompt_submit_uses_compacted_active_history_without_replacing_visib
         compacted_messages=[{"role": "assistant", "content": "checkpoint"}],
         compression_count=1,
         focus_topic=None,
-        raw_message_count=10,
+        raw_message_count=20,
         summary="summary",
         tokens_after=100,
         tokens_before=1000,
@@ -625,33 +625,25 @@ def test_tui_prompt_submit_uses_compacted_active_history_without_replacing_visib
 
     result = agent.run_conversation("new", conversation_history=list(raw_history))
 
-    assert seen_histories == [
-        [
-            {"role": "assistant", "content": "checkpoint"},
-            {"role": "user", "content": "raw-10"},
-            {"role": "user", "content": "raw-11"},
-        ]
-    ]
+    assert seen_histories == [[{"role": "assistant", "content": "checkpoint"}]]
     assert result["messages"] == raw_history + [
         {"role": "user", "content": "new"},
         {"role": "assistant", "content": "ok"},
     ]
     assert agent._session_messages == [
         {"role": "assistant", "content": "checkpoint"},
-        {"role": "user", "content": "raw-10"},
-        {"role": "user", "content": "raw-11"},
         {"role": "user", "content": "new"},
         {"role": "assistant", "content": "ok"},
     ]
-    assert agent.context_compressor.last_prompt_tokens == 5 * 100 + len("system")
+    assert agent.context_compressor.last_prompt_tokens == 3 * 100 + len("system")
     assert emitted == [
-        ("session.info", "sid-live", {"usage": {"context_used": 406}}),
-        ("session.info", "sid-live", {"usage": {"context_used": 506}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 206}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 306}}),
     ]
 
 
 
-def test_tui_hydration_ignores_stale_compaction_state_that_is_ahead_of_history(
+def test_tui_hydration_uses_compacted_fallback_when_checkpoint_is_ahead_of_history(
     plugin_modules: PluginModules,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -693,8 +685,9 @@ def test_tui_hydration_ignores_stale_compaction_state_that_is_ahead_of_history(
         "session_key": "session-live",
         "history": list(raw_history),
     }
+    compacted = [{"role": "assistant", "content": "checkpoint only"}]
     record = helpers_module.PersistedCompactionState(
-        compacted_messages=[{"role": "assistant", "content": "checkpoint only"}],
+        compacted_messages=compacted,
         compression_count=7,
         focus_topic=None,
         raw_message_count=200,
@@ -709,12 +702,14 @@ def test_tui_hydration_ignores_stale_compaction_state_that_is_ahead_of_history(
         lambda *, session_id, hermes_home: record,
     )
 
+    monkeypatch.setattr(sidecar_module, "_estimate_request_tokens", lambda **kwargs: 24_251)
+
     sidecar_module._hydrate_tui_session_history_from_plugin_state(session)
 
-    assert session["history"] == raw_history
-    assert not hasattr(agent, "_session_messages")
-    assert agent.context_compressor.last_prompt_tokens == 0
-    assert agent.context_compressor.last_total_tokens == 0
+    assert session["history"] == compacted
+    assert agent._session_messages == compacted
+    assert agent.context_compressor.last_prompt_tokens == 24_251
+    assert agent.context_compressor.last_total_tokens == 24_251
     assert agent.context_compressor.persisted is True
 
 
@@ -1453,6 +1448,9 @@ def test_sidecar_bridge_emits_auto_status_and_records_artifact(
     assert artifact["tokens_after"] == expected_tokens_after
     stored_record = stored_states["session_123"]
     assert getattr(stored_record, "raw_message_count") == 8
+    assert getattr(stored_record, "raw_cursor_message_count") == 8
+    assert getattr(stored_record, "raw_cursor_message_hash")
+    assert ":1:8:" in getattr(stored_record, "checkpoint_id")
     assert getattr(stored_record, "tokens_after") == expected_tokens_after
 
     before_manual = list(cli.agent.printed)
@@ -1741,6 +1739,87 @@ def test_runtime_defaults_derives_context_limit_from_runtime_provider_and_model(
             "provider": "runtime-provider",
         }
     ]
+
+
+def test_hydration_uses_checkpoint_cursor_hash_when_message_count_drifted(
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, sidecar_module = plugin_modules
+    raw_history = [
+        {"role": "user", "content": "before-0"},
+        {"role": "assistant", "content": "before-1"},
+        {"role": "user", "content": "cursor"},
+        {"role": "assistant", "content": "after-0"},
+        {"role": "user", "content": "after-1"},
+    ]
+    record = helpers_module.PersistedCompactionState(
+        checkpoint_id="sid:1:99:cursor",
+        compacted_messages=[{"role": "assistant", "content": "checkpoint"}],
+        compression_count=1,
+        focus_topic=None,
+        raw_cursor_message_count=99,
+        raw_cursor_message_hash=sidecar_module._message_cursor_hash(raw_history[2]),
+        raw_message_count=99,
+        summary="summary",
+        tokens_after=100,
+        tokens_before=1000,
+        updated_at=1.0,
+    )
+
+    hydrated = sidecar_module._hydrate_messages_from_record(
+        raw_messages=raw_history,
+        record=record,
+    )
+
+    assert hydrated == [
+        {"role": "assistant", "content": "checkpoint"},
+        {"role": "assistant", "content": "after-0"},
+        {"role": "user", "content": "after-1"},
+    ]
+
+
+
+def test_runtime_defaults_use_repo_threshold_not_stale_user_override(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        helpers_module,
+        "load_plugin_root_config",
+        lambda: {
+            "defaults": {
+                "model": "summary-model",
+                "reasoning_effort": "medium",
+                "summary_retry_attempts": 3,
+                "compaction_threshold_percent": 0.85,
+                "head_preserve_messages": 0,
+                "minimum_tail_messages": 0,
+                "tail_preserve_tokens": 0,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        helpers_module,
+        "load_config",
+        lambda: {
+            "model": {"context_length": 272_000},
+            "compression": {"threshold": 0.85},
+            "operational_checkpoint": {"compaction_threshold_percent": 0.7},
+        },
+    )
+    monkeypatch.setattr(
+        helpers_module,
+        "get_model_context_length",
+        lambda **kwargs: 272_000,
+    )
+
+    defaults = helpers_module.load_runtime_defaults()
+
+    assert defaults["compaction_threshold_percent"] == 0.85
+    assert defaults["auto_compact_at_tokens"] == 231_200
+
 
 
 def test_update_model_recomputes_threshold_as_percent_of_runtime_context(
@@ -3221,7 +3300,7 @@ def test_auto_preflight_compaction_continues_turn(
     plugin_modules: PluginModules,
     tmp_path: Path,
 ) -> None:
-    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+    _package, compressor_module, helpers_module, _sidecar_module = plugin_modules
     import hermes_cli.plugins as plugins_mod
     import run_agent
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -3245,6 +3324,21 @@ def test_auto_preflight_compaction_continues_turn(
 
     monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [])
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(
+        helpers_module,
+        "load_plugin_root_config",
+        lambda: {
+            "defaults": {
+                "model": "gpt-5.4-mini",
+                "reasoning_effort": "medium",
+                "summary_retry_attempts": 3,
+                "compaction_threshold_percent": 0.005,
+                "head_preserve_messages": 3,
+                "minimum_tail_messages": 3,
+                "tail_preserve_tokens": 200,
+            }
+        },
+    )
 
     def fake_summary_call_llm(
         *,

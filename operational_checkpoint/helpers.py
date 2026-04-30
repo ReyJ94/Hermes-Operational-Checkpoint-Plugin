@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -59,6 +60,10 @@ class PersistedCompactionState:
     tokens_after: int
     tokens_before: int
     updated_at: float
+    checkpoint_id: str = ""
+    previous_checkpoint_id: str = ""
+    raw_cursor_message_count: int = 0
+    raw_cursor_message_hash: str = ""
 
 
 def require_attr(module: object, attr_name: str) -> object:
@@ -172,6 +177,17 @@ def _coerce_message_dict(value: object) -> dict[str, object] | None:
     return coerced
 
 
+def _message_hash(message: dict[str, object]) -> str:
+    payload: str = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cursor_hash_for_messages(messages: list[dict[str, object]], raw_message_count: int) -> str:
+    if raw_message_count <= 0 or raw_message_count > len(messages):
+        return ""
+    return _message_hash(messages[raw_message_count - 1])
+
+
 def load_compaction_states(
     raw_hermes_home: object | None = None,
 ) -> dict[str, PersistedCompactionState]:
@@ -209,6 +225,18 @@ def load_compaction_states(
             if isinstance(updated_at_raw, (float, int)) and not isinstance(updated_at_raw, bool)
             else 0.0
         )
+        raw_cursor_count: int = as_positive_int(
+            state_value.get("raw_cursor_message_count"),
+            as_positive_int(state_value.get("raw_message_count"), 0),
+        )
+        raw_cursor_hash: str = string_or_empty(
+            state_value.get("raw_cursor_message_hash")
+        ).strip()
+        if not raw_cursor_hash:
+            raw_cursor_hash = _cursor_hash_for_messages(
+                compacted_messages,
+                min(raw_cursor_count, len(compacted_messages)),
+            )
         states[session_id] = PersistedCompactionState(
             compacted_messages=compacted_messages,
             compression_count=as_positive_int(state_value.get("compression_count"), 0),
@@ -218,6 +246,12 @@ def load_compaction_states(
             tokens_after=as_positive_int(state_value.get("tokens_after"), 0),
             tokens_before=as_positive_int(state_value.get("tokens_before"), 0),
             updated_at=updated_at,
+            checkpoint_id=string_or_empty(state_value.get("checkpoint_id")).strip(),
+            previous_checkpoint_id=string_or_empty(
+                state_value.get("previous_checkpoint_id")
+            ).strip(),
+            raw_cursor_message_count=raw_cursor_count,
+            raw_cursor_message_hash=raw_cursor_hash,
         )
     return states
 
@@ -246,9 +280,15 @@ def save_compaction_states(
                 message_payload[str(key)] = value
             compacted_messages.append(message_payload)
         serialized[session_id] = {
+            "checkpoint_id": state.checkpoint_id,
             "compacted_messages": compacted_messages,
             "compression_count": int(state.compression_count),
             "focus_topic": state.focus_topic,
+            "previous_checkpoint_id": state.previous_checkpoint_id,
+            "raw_cursor_message_count": int(
+                state.raw_cursor_message_count or state.raw_message_count
+            ),
+            "raw_cursor_message_hash": state.raw_cursor_message_hash,
             "raw_message_count": int(state.raw_message_count),
             "summary": state.summary,
             "tokens_after": int(state.tokens_after),
@@ -497,13 +537,19 @@ def load_runtime_defaults() -> dict[str, object]:
         provider=runtime_provider,
     )
 
-    threshold_percent_value: object = plugin_cfg.get("compaction_threshold_percent")
+    compression_cfg: dict[str, object] = as_mapping(config.get("compression"))
+    threshold_percent_value: object = plugin_root_defaults.get(
+        "compaction_threshold_percent"
+    )
     if threshold_percent_value is None:
-        threshold_percent_value = plugin_cfg.get("threshold_percent")
+        threshold_percent_value = plugin_root_defaults.get("threshold_percent")
+    if threshold_percent_value is None:
+        threshold_percent_value = compression_cfg.get("threshold")
     if threshold_percent_value is None and plugin_cfg.get("auto_compact_at_tokens") is not None:
         # Legacy compatibility for older configs/tests. New configs should set
-        # compaction_threshold_percent and let provider+model metadata own the
-        # context window.
+        # the repo-owned compaction_threshold_percent and let provider+model
+        # metadata own the context window. Per-user Hermes overrides are not the
+        # source of truth for Operational Checkpoint's agreed checkpoint policy.
         threshold_percent = require_positive_int(
             plugin_cfg.get("auto_compact_at_tokens"),
             "auto_compact_at_tokens",

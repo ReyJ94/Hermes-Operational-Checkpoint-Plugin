@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sys
 import threading
@@ -358,6 +360,20 @@ def _emit_tui_usage_update(agent: object) -> None:
         logger.debug("Operational Checkpoint TUI usage update failed", exc_info=True)
 
 
+def _emit_tui_status_update(agent: object, kind: str, text: str) -> None:
+    tui_session: tuple[ModuleType, str, dict[str, object]] | None = _tui_session_for_agent(agent)
+    if tui_session is None:
+        return
+    module, sid, _session = tui_session
+    emit: object = getattr(module, "_emit", None)
+    if not callable(emit):
+        return
+    try:
+        emit("status.update", sid, {"kind": kind, "text": text})
+    except Exception:
+        logger.debug("Operational Checkpoint TUI status update failed", exc_info=True)
+
+
 def _install_usage_update_hook(agent: object, engine: CompactionCallbackEngineLike) -> None:
     installed: object = getattr(engine, "_operational_checkpoint_usage_hook_installed", False)
     if installed:
@@ -486,6 +502,7 @@ def _persist_compaction_state(
     raw_message_count: int,
     tokens_after: int,
     tokens_before: int,
+    raw_cursor_message_hash: str = "",
 ) -> PersistedCompactionState | None:
     session_id: str = string_or_empty(getattr(agent, "session_id", "")).strip()
     if not session_id:
@@ -494,11 +511,24 @@ def _persist_compaction_state(
     hermes_home: object = getattr(engine, "hermes_home", None)
     states: dict[str, PersistedCompactionState] = load_compaction_states(hermes_home)
     summary: str = string_or_empty(getattr(engine, "last_checkpoint_summary", "")).strip()
+    previous_record: PersistedCompactionState | None = states.get(session_id)
+    compression_count: int = int(getattr(engine, "compression_count", 0) or 0)
+    normalized_raw_message_count: int = max(0, raw_message_count)
+    checkpoint_id: str = _checkpoint_id(
+        session_id=session_id,
+        compression_count=compression_count,
+        raw_message_count=normalized_raw_message_count,
+        raw_cursor_message_hash=raw_cursor_message_hash,
+    )
     record = PersistedCompactionState(
+        checkpoint_id=checkpoint_id,
         compacted_messages=_copy_message_list(compressed_messages),
-        compression_count=int(getattr(engine, "compression_count", 0) or 0),
+        compression_count=compression_count,
         focus_topic=focus_topic,
-        raw_message_count=max(0, raw_message_count),
+        previous_checkpoint_id=previous_record.checkpoint_id if previous_record else "",
+        raw_cursor_message_count=normalized_raw_message_count,
+        raw_cursor_message_hash=raw_cursor_message_hash,
+        raw_message_count=normalized_raw_message_count,
         summary=summary,
         tokens_after=max(0, tokens_after),
         tokens_before=max(0, tokens_before),
@@ -521,6 +551,28 @@ def _load_persisted_compaction_state(
 
 def _copy_message_list(messages: list[dict[str, object]]) -> list[dict[str, object]]:
     return [dict(message) for message in messages]
+
+
+def _message_cursor_hash(message: dict[str, object]) -> str:
+    payload: str = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _raw_cursor_hash(raw_messages: list[dict[str, object]], raw_message_count: int) -> str:
+    if raw_message_count <= 0 or raw_message_count > len(raw_messages):
+        return ""
+    return _message_cursor_hash(raw_messages[raw_message_count - 1])
+
+
+def _checkpoint_id(
+    *,
+    session_id: str,
+    compression_count: int,
+    raw_message_count: int,
+    raw_cursor_message_hash: str,
+) -> str:
+    hash_prefix: str = raw_cursor_message_hash[:12] if raw_cursor_message_hash else "nohash"
+    return f"{session_id}:{compression_count}:{raw_message_count}:{hash_prefix}"
 
 
 def _message_for_current_user_turn(user_message: object) -> dict[str, object]:
@@ -578,7 +630,19 @@ def _hydrate_messages_from_record(
     raw_messages: list[dict[str, object]],
     record: PersistedCompactionState,
 ) -> list[dict[str, object]]:
-    raw_tail_start: int = min(record.raw_message_count, len(raw_messages))
+    raw_tail_start: int = min(
+        record.raw_cursor_message_count or record.raw_message_count,
+        len(raw_messages),
+    )
+    if record.raw_cursor_message_hash and raw_tail_start > 0:
+        expected_index: int = raw_tail_start - 1
+        if _message_cursor_hash(raw_messages[expected_index]) != record.raw_cursor_message_hash:
+            matching_index: int | None = None
+            for index, raw_message in enumerate(raw_messages):
+                if _message_cursor_hash(raw_message) == record.raw_cursor_message_hash:
+                    matching_index = index
+                    break
+            raw_tail_start = len(raw_messages) if matching_index is None else matching_index + 1
     hydrated_messages: list[dict[str, object]] = _copy_message_list(record.compacted_messages)
     hydrated_messages.extend(_copy_message_list(raw_messages[raw_tail_start:]))
     return hydrated_messages
@@ -707,15 +771,11 @@ def _hydrate_tui_session_history_from_plugin_state(session: object) -> None:
         return
     if record.raw_message_count > len(raw_history):
         logger.warning(
-            "Operational Checkpoint ignored stale TUI compaction state: session=%s raw_message_count=%d history_len=%d",
+            "Operational Checkpoint using compacted fallback for stale TUI compaction state: session=%s raw_message_count=%d history_len=%d",
             session_id,
             record.raw_message_count,
             len(raw_history),
         )
-        _set_active_compaction_state(agent=agent, record=None)
-        _set_context_token_state(engine=engine, request_tokens=0)
-        _emit_tui_usage_update(agent)
-        return
 
     hydrated_history: list[dict[str, object]] = _hydrate_messages_from_record(
         raw_messages=raw_history,
@@ -769,6 +829,7 @@ def _perform_plugin_owned_compaction(
         system_prompt=active_system_prompt,
     )
     raw_message_count: int = _raw_message_count_for_hydrated_messages(agent, messages)
+    raw_cursor_message_hash: str = _raw_cursor_hash(messages, raw_message_count)
     logger.info(
         "operational checkpoint compaction started: session=%s messages=%d tokens=~%s focus=%r",
         string_or_empty(getattr(agent, "session_id", "")).strip() or "none",
@@ -833,6 +894,7 @@ def _perform_plugin_owned_compaction(
         raw_message_count=raw_message_count,
         tokens_after=compacted_tokens,
         tokens_before=current_request_tokens,
+        raw_cursor_message_hash=raw_cursor_message_hash,
     )
     if record is not None:
         object.__setattr__(agent, "_session_messages", list(compressed))
@@ -1147,7 +1209,9 @@ def _emit_start_status(
     )
     if focus_topic:
         line = f'{line}, focus: "{focus_topic}"'
-    _safe_emit(agent, line + "...")
+    status_text = line + "..."
+    _emit_tui_status_update(agent, "compressing", status_text)
+    _safe_emit(agent, status_text)
 
 
 @dataclass(slots=True)
@@ -1171,16 +1235,17 @@ def _emit_end_status(
         return
 
     if status.compression_count_after <= status.compression_count_before:
-        _safe_emit(agent, "  Operational Checkpoint made no further reduction.")
+        line = "  Operational Checkpoint made no further reduction."
+        _emit_tui_status_update(agent, "status", line.strip())
+        _safe_emit(agent, line)
         return
 
-    _safe_emit(
-        agent,
-        (
-            "  Operational Checkpoint reduced active context budget: "
-            f"{_fmt_tokens(status.tokens_before)} → {_fmt_tokens(status.tokens_after)} tokens"
-        ),
+    line = (
+        "  Operational Checkpoint reduced active context budget: "
+        f"{_fmt_tokens(status.tokens_before)} → {_fmt_tokens(status.tokens_after)} tokens"
     )
+    _emit_tui_status_update(agent, "status", line.strip())
+    _safe_emit(agent, line)
     if status.summary_preview_line:
         _safe_emit(agent, status.summary_preview_line)
 
@@ -1192,7 +1257,9 @@ def _emit_failure_status(
 ) -> None:
     if not _should_emit_status() or trigger == "manual":
         return
-    _safe_emit(agent, f"  Operational Checkpoint failed: {exc}")
+    line = f"  Operational Checkpoint failed: {exc}"
+    _emit_tui_status_update(agent, "error", line.strip())
+    _safe_emit(agent, line)
 
 
 def _load_original_init_agent(
@@ -1609,8 +1676,15 @@ def _build_patched_run_conversation(
                 hermes_home=getattr(engine, "hermes_home", None),
             )
             _set_active_compaction_state(agent=self, record=record)
-        if record is None or record.raw_message_count > len(raw_history):
+        if record is None:
             return original_run_conversation(self, *args, **kwargs)
+        if record.raw_message_count > len(raw_history):
+            logger.warning(
+                "Operational Checkpoint using compacted fallback for stale prompt history: session=%s raw_message_count=%d history_len=%d",
+                string_or_empty(getattr(self, "session_id", "")).strip() or "none",
+                record.raw_message_count,
+                len(raw_history),
+            )
 
         raw_dict_history: list[dict[str, object]] = [
             message for message in raw_history if isinstance(message, dict)
@@ -1646,16 +1720,108 @@ def _build_patched_run_conversation(
                 ),
             }
 
-        if "conversation_history" in kwargs or not positional_history:
-            result: object = original_run_conversation(
-                self,
-                *args,
-                **{**kwargs, "conversation_history": hydrated_history},
+        live_tool_messages: list[dict[str, object]] = _copy_message_list(in_flight_messages)
+        live_tool_lock: threading.Lock = threading.Lock()
+        assistant_tool_message_index: int | None = None
+        original_tool_start_callback: object = getattr(self, "tool_start_callback", None)
+        original_tool_complete_callback: object = getattr(self, "tool_complete_callback", None)
+
+        def emit_live_tool_usage() -> None:
+            _refresh_context_token_state(
+                agent=self,
+                engine=engine,
+                messages=live_tool_messages,
+                system_prompt=_active_system_prompt(self, ""),
+                persist=False,
             )
-        else:
-            mutable_args: list[object] = list(args)
-            mutable_args[2] = hydrated_history
-            result = original_run_conversation(self, *mutable_args, **kwargs)
+            _emit_tui_usage_update(self)
+
+        def wrapped_tool_start(
+            tool_call_id: object,
+            name: object,
+            tool_args: object,
+        ) -> object:
+            nonlocal assistant_tool_message_index
+            callback_result: object = None
+            if callable(original_tool_start_callback):
+                callback_result = original_tool_start_callback(tool_call_id, name, tool_args)
+            with live_tool_lock:
+                if (
+                    assistant_tool_message_index is None
+                    or assistant_tool_message_index >= len(live_tool_messages)
+                    or live_tool_messages[assistant_tool_message_index].get("role") != "assistant"
+                ):
+                    live_tool_messages.append(
+                        {"role": "assistant", "content": "", "tool_calls": []}
+                    )
+                    assistant_tool_message_index = len(live_tool_messages) - 1
+                assistant_message: dict[str, object] = live_tool_messages[
+                    assistant_tool_message_index
+                ]
+                tool_calls: object = assistant_message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    arguments: str = json.dumps(
+                        tool_args if isinstance(tool_args, dict) else {},
+                        ensure_ascii=False,
+                    )
+                    tool_calls.append(
+                        {
+                            "id": string_or_empty(tool_call_id),
+                            "type": "function",
+                            "function": {
+                                "name": string_or_empty(name),
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+                emit_live_tool_usage()
+            return callback_result
+
+        def wrapped_tool_complete(
+            tool_call_id: object,
+            name: object,
+            tool_args: object,
+            result_text: object,
+        ) -> object:
+            callback_result: object = None
+            if callable(original_tool_complete_callback):
+                callback_result = original_tool_complete_callback(
+                    tool_call_id,
+                    name,
+                    tool_args,
+                    result_text,
+                )
+            with live_tool_lock:
+                live_tool_messages.append(
+                    {
+                        "role": "tool",
+                        "content": string_or_empty(result_text),
+                        "tool_call_id": string_or_empty(tool_call_id),
+                    }
+                )
+                emit_live_tool_usage()
+            return callback_result
+
+        object.__setattr__(self, "tool_start_callback", wrapped_tool_start)
+        object.__setattr__(self, "tool_complete_callback", wrapped_tool_complete)
+        try:
+            if "conversation_history" in kwargs or not positional_history:
+                result: object = original_run_conversation(
+                    self,
+                    *args,
+                    **{**kwargs, "conversation_history": hydrated_history},
+                )
+            else:
+                mutable_args: list[object] = list(args)
+                mutable_args[2] = hydrated_history
+                result = original_run_conversation(self, *mutable_args, **kwargs)
+        finally:
+            object.__setattr__(self, "tool_start_callback", original_tool_start_callback)
+            object.__setattr__(
+                self,
+                "tool_complete_callback",
+                original_tool_complete_callback,
+            )
 
         if not isinstance(result, dict):
             return result
@@ -1675,10 +1841,8 @@ def _build_patched_run_conversation(
         # Recompute the active state from the raw-visible transcript so the next
         # prompt.submit does not silently feed the full raw scrollback back into
         # the provider.
-        active_messages: list[dict[str, object]] = _hydrate_messages_from_record(
-            raw_messages=visible_messages,
-            record=record,
-        )
+        active_messages: list[dict[str, object]] = _copy_message_list(hydrated_history)
+        active_messages.extend(_copy_message_list(new_messages))
         object.__setattr__(self, "_session_messages", active_messages)
         _agent_runtime_state(self).hydrated_cursor = len(active_messages)
         _refresh_context_token_state(
