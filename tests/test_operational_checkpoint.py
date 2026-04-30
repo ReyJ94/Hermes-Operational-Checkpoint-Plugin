@@ -344,21 +344,40 @@ def test_agent_runtime_bridge_refreshes_tui_usage_after_response_usage_update(
     tui_module._session_info = session_info
     tui_module._sessions = {}
     monkeypatch.setitem(sys.modules, "tui_gateway.server", tui_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "estimate_request_tokens_rough",
+        lambda messages, *, system_prompt="", tools=None: len(messages) * 100 + len(system_prompt) + (7 if tools else 0),
+    )
 
     sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
     agent = FakeAgent()
-    tui_module._sessions = {"sid-live": {"agent": agent}}
+    agent._cached_system_prompt = "system"
+    agent.tools = [{"type": "function", "function": {"name": "noop"}}]
+    tui_module._sessions = {
+        "sid-live": {
+            "agent": agent,
+            "history": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+            ],
+        }
+    }
 
     agent.context_compressor.update_from_response(
         {"prompt_tokens": 252_000, "completion_tokens": 1_000, "total_tokens": 253_000}
     )
 
+    expected_context_used = 2 * 100 + len("system") + 7
     assert agent.context_compressor.bound_session_id == "session-live"
+    assert agent.context_compressor.last_prompt_tokens == expected_context_used
+    assert agent.context_compressor.last_completion_tokens == 0
+    assert agent.context_compressor.last_total_tokens == expected_context_used
     assert emitted == [
         (
             "session.info",
             "sid-live",
-            {"usage": {"context_used": 252_000, "context_max": 400_000, "context_percent": 63}},
+            {"usage": {"context_used": expected_context_used, "context_max": 400_000, "context_percent": 0}},
         )
     ]
 
@@ -1030,11 +1049,11 @@ def test_sidecar_bridge_emits_auto_status_and_records_artifact(
 
     assert compressed == [{"role": "user", "content": "checkpoint"}]
     assert cli.agent.printed[0] == (
-        f"🗜️  Operational Checkpoint: auto-compacting ~{expected_tokens_before:,} / 350,000 "
+        f"Operational Checkpoint: auto-compacting ~{expected_tokens_before:,} / 350,000 "
         'tokens, focus: "adapter seam"...'
     )
     assert cli.agent.printed[1] == (
-        "  ✅ Operational Checkpoint reduced active context budget: "
+        "  Operational Checkpoint reduced active context budget: "
         f"~{expected_tokens_before:,} → ~{expected_tokens_after:,} tokens"
     )
     assert cli.agent.printed[2].startswith("     checkpoint: Goal keep moving.")
@@ -1175,9 +1194,13 @@ def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
     history = [{"role": "user", "content": "raw"}] * 8
     server_module = ModuleType("tui_gateway.server")
     server_module._sessions = {"sid-tui": {"agent": agent, "history": history}}
+    emitted_events: list[tuple[str, str, dict[str, object] | None]] = []
 
     def status_update(sid: str, kind: str, text: str | None = None) -> None:
         status_updates.append((sid, kind, text))
+
+    def emit(event: str, sid: str, payload: dict[str, object] | None = None) -> None:
+        emitted_events.append((event, sid, payload))
 
     def original_session_compress(rid: object, params: dict[str, object]) -> dict[str, object]:
         del rid
@@ -1211,6 +1234,7 @@ def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
         }
 
     server_module._methods = {"session.compress": original_session_compress}
+    server_module._emit = emit
     server_module._status_update = status_update
     monkeypatch.setitem(sys.modules, "tui_gateway.server", server_module)
     sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
@@ -1227,7 +1251,6 @@ def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
         system_prompt="",
         tools=[],
     )
-    expected_before = max(expected_before, 22_800)
     expected_after = sidecar_module.estimate_request_tokens_rough(
         [{"role": "user", "content": "checkpoint"}],
         system_prompt="",
@@ -1236,10 +1259,27 @@ def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
     assert status_updates == [
         (
             "sid-tui",
-            "compressing",
-            f'🗜️  Operational Checkpoint: compacting active context budget ~{expected_before:,} tokens, focus: "tui focus"...',
+            "status",
+            f'Operational Checkpoint: compacting active context budget ~{expected_before:,} tokens, focus: "tui focus"...',
         )
     ]
+    assert emitted_events[0] == (
+        "tool.start",
+        "sid-tui",
+        {
+            "tool_id": "operational-checkpoint-compress-sid-tui",
+            "name": "operational_checkpoint",
+            "context": f'active context budget ~{expected_before:,} tokens, focus: "tui focus"',
+        },
+    )
+    assert emitted_events[1][0] == "tool.complete"
+    assert emitted_events[1][1] == "sid-tui"
+    assert emitted_events[1][2] is not None
+    assert emitted_events[1][2]["tool_id"] == "operational-checkpoint-compress-sid-tui"
+    assert emitted_events[1][2]["name"] == "operational_checkpoint"
+    assert emitted_events[1][2]["summary"] == "active context checkpoint updated"
+    assert isinstance(emitted_events[1][2]["duration_s"], float)
+    assert "error" not in emitted_events[1][2]
     result = response["result"]
     assert result["before_tokens"] == expected_before
     assert result["after_tokens"] == expected_after
@@ -1249,10 +1289,105 @@ def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
     )
     assert "messages" not in result["summary"]["headline"].lower()
     assert "Rough transcript estimate" not in result["summary"]["token_line"]
+    assert "messages" not in result
     artifact = result["operational_checkpoint"]
     assert artifact["trigger"] == "manual"
     assert artifact["tokens_before"] == expected_before
     assert artifact["tokens_after"] == expected_after
+
+
+def test_runtime_defaults_derives_context_limit_from_runtime_provider_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, helpers_module, _sidecar_module = plugin_modules
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        helpers_module,
+        "load_plugin_root_config",
+        lambda: {
+            "defaults": {
+                "model": "summary-model",
+                "reasoning_effort": "medium",
+                "summary_retry_attempts": 3,
+                "compaction_threshold_percent": 0.5,
+                "head_preserve_messages": 0,
+                "minimum_tail_messages": 0,
+                "tail_preserve_tokens": 0,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        helpers_module,
+        "load_config",
+        lambda: {
+            "model": {
+                "default": "runtime-model",
+                "provider": "runtime-provider",
+                "base_url": "https://provider.example/v1",
+            },
+            "operational_checkpoint": {},
+        },
+    )
+
+    def fake_get_model_context_length(**kwargs: object) -> int:
+        calls.append(dict(kwargs))
+        return 272_000
+
+    monkeypatch.setattr(
+        helpers_module,
+        "get_model_context_length",
+        fake_get_model_context_length,
+    )
+
+    defaults = helpers_module.load_runtime_defaults()
+
+    assert defaults["context_limit_tokens"] == 272_000
+    assert defaults["compaction_threshold_percent"] == 0.5
+    assert defaults["auto_compact_at_tokens"] == 136_000
+    assert calls == [
+        {
+            "model": "runtime-model",
+            "base_url": "https://provider.example/v1",
+            "api_key": "",
+            "config_context_length": None,
+            "provider": "runtime-provider",
+        }
+    ]
+
+
+def test_update_model_recomputes_threshold_as_percent_of_runtime_context(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 350_000,
+            "base_url": "",
+            "compaction_threshold_percent": 0.85,
+            "config_context_length": 400_000,
+            "context_limit_tokens": 400_000,
+            "head_preserve_messages": 0,
+            "minimum_tail_messages": 0,
+            "model": "summary-model",
+            "provider": "",
+            "reasoning_effort": "medium",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 0,
+        },
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    engine.update_model("gpt-5.5", context_length=272_000, provider="openai-codex")
+
+    assert engine.context_length == 272_000
+    assert engine.threshold_percent == 0.85
+    assert engine.threshold_tokens == 231_200
 
 
 def test_runtime_defaults_use_plugin_toml_model_and_reasoning_only(
@@ -1399,8 +1534,7 @@ def test_load_plugin_root_config_falls_back_to_packaged_config(
         'model = "packaged-model"\n'
         'reasoning_effort = "low"\n'
         "summary_retry_attempts = 3\n"
-        "context_limit_tokens = 400000\n"
-        "auto_compact_at_tokens = 350000\n"
+        "compaction_threshold_percent = 0.85\n"
         "head_preserve_messages = 3\n"
         "minimum_tail_messages = 3\n"
         "tail_preserve_tokens = 20000\n",
@@ -2715,8 +2849,7 @@ def test_auto_preflight_compaction_continues_turn(
         "context:\n"
         "  engine: operational_checkpoint\n"
         "operational_checkpoint:\n"
-        "  context_limit_tokens: 70000\n"
-        "  auto_compact_at_tokens: 1000\n"
+        "  compaction_threshold_percent: 0.005\n"
         "  head_preserve_messages: 3\n"
         "  minimum_tail_messages: 3\n"
         "  tail_preserve_tokens: 200\n"

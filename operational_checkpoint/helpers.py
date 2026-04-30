@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeGuard
 
+from agent.model_metadata import get_model_context_length
+
 SUMMARY_PREFIX: str = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -412,6 +414,24 @@ def require_string(value: object, key_name: str) -> str:
     return parsed
 
 
+
+def require_fraction(value: object, key_name: str) -> float:
+    if isinstance(value, bool):
+        error_message = f"operational_checkpoint.{key_name} must be a number between 0 and 1"
+        raise TypeError(error_message)
+    if isinstance(value, (float, int)):
+        parsed = float(value)
+    elif isinstance(value, str) and value.strip():
+        parsed = float(value)
+    else:
+        error_message = f"operational_checkpoint.{key_name} is required"
+        raise TypeError(error_message)
+    if parsed <= 0 or parsed >= 1:
+        error_message = f"operational_checkpoint.{key_name} must be greater than 0 and less than 1"
+        raise ValueError(error_message)
+    return parsed
+
+
 def string_or_empty(value: object) -> str:
     if value is None:
         return ""
@@ -466,21 +486,39 @@ def load_runtime_defaults() -> dict[str, object]:
     plugin_cfg: dict[str, object] = load_operational_checkpoint_config()
     model_cfg: dict[str, object] = as_mapping(config.get("model"))
 
-    context_limit_tokens: int = require_positive_int(
-        plugin_cfg.get("context_limit_tokens")
-        if plugin_cfg.get("context_limit_tokens") is not None
-        else model_cfg.get("context_length"),
-        "context_limit_tokens",
+    runtime_model: str = string_or_empty(model_cfg.get("default")).strip()
+    runtime_provider: str = string_or_empty(model_cfg.get("provider")).strip()
+    runtime_base_url: str = string_or_empty(model_cfg.get("base_url"))
+    context_limit_tokens: int = get_model_context_length(
+        model=runtime_model,
+        base_url=runtime_base_url,
+        api_key=string_or_empty(model_cfg.get("api_key")),
+        config_context_length=as_positive_int(model_cfg.get("context_length"), 0) or None,
+        provider=runtime_provider,
     )
-    auto_compact_at_tokens: int = require_positive_int(
-        plugin_cfg.get("auto_compact_at_tokens"),
-        "auto_compact_at_tokens",
-    )
-    if auto_compact_at_tokens >= context_limit_tokens:
-        raise ValueError(
-            "operational_checkpoint.auto_compact_at_tokens must be less than "
-            "operational_checkpoint.context_limit_tokens"
+
+    threshold_percent_value: object = plugin_cfg.get("compaction_threshold_percent")
+    if threshold_percent_value is None:
+        threshold_percent_value = plugin_cfg.get("threshold_percent")
+    if threshold_percent_value is None and plugin_cfg.get("auto_compact_at_tokens") is not None:
+        # Legacy compatibility for older configs/tests. New configs should set
+        # compaction_threshold_percent and let provider+model metadata own the
+        # context window.
+        threshold_percent = require_positive_int(
+            plugin_cfg.get("auto_compact_at_tokens"),
+            "auto_compact_at_tokens",
+        ) / context_limit_tokens
+        if threshold_percent <= 0 or threshold_percent >= 1:
+            raise ValueError(
+                "operational_checkpoint.auto_compact_at_tokens must resolve to "
+                "a fraction greater than 0 and less than the provider/model context window"
+            )
+    else:
+        threshold_percent = require_fraction(
+            threshold_percent_value,
+            "compaction_threshold_percent",
         )
+    auto_compact_at_tokens: int = max(1, int(context_limit_tokens * threshold_percent))
 
     tail_preserve_tokens: int = require_non_negative_int(
         plugin_cfg.get("tail_preserve_tokens"),
@@ -489,13 +527,14 @@ def load_runtime_defaults() -> dict[str, object]:
     if tail_preserve_tokens >= auto_compact_at_tokens:
         raise ValueError(
             "operational_checkpoint.tail_preserve_tokens must be less than "
-            "operational_checkpoint.auto_compact_at_tokens"
+            "the configured compaction threshold"
         )
 
     return {
         "auto_compact_at_tokens": auto_compact_at_tokens,
-        "base_url": string_or_empty(model_cfg.get("base_url")),
-        "config_context_length": context_limit_tokens,
+        "base_url": runtime_base_url,
+        "compaction_threshold_percent": threshold_percent,
+        "config_context_length": None,
         "context_limit_tokens": context_limit_tokens,
         "head_preserve_messages": require_non_negative_int(
             plugin_cfg.get("head_preserve_messages"),
@@ -506,7 +545,7 @@ def load_runtime_defaults() -> dict[str, object]:
             "minimum_tail_messages",
         ),
         "model": require_string(plugin_root_defaults.get("model"), "model"),
-        "provider": string_or_empty(model_cfg.get("provider")),
+        "provider": runtime_provider,
         "reasoning_effort": normalize_reasoning_effort(
             plugin_root_defaults.get("reasoning_effort")
         ),

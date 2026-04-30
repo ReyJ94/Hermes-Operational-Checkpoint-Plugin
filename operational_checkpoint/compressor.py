@@ -269,9 +269,18 @@ class OperationalCheckpointCompressor(ContextEngine):
             defaults.get("context_limit_tokens"),
             "context_limit_tokens",
         )
-        auto_compact_at_tokens: int = require_positive_int(
-            defaults.get("auto_compact_at_tokens"),
-            "auto_compact_at_tokens",
+        raw_threshold_percent: object = defaults.get("compaction_threshold_percent")
+        if raw_threshold_percent is None:
+            legacy_threshold_tokens = require_positive_int(
+                defaults.get("auto_compact_at_tokens"),
+                "auto_compact_at_tokens",
+            )
+            compaction_threshold_percent = legacy_threshold_tokens / context_limit_tokens
+        else:
+            compaction_threshold_percent = float(raw_threshold_percent)
+        auto_compact_at_tokens: int = max(
+            1,
+            int(context_limit_tokens * compaction_threshold_percent),
         )
         head_preserve_messages: int = require_non_negative_int(
             defaults.get("head_preserve_messages"),
@@ -309,7 +318,7 @@ class OperationalCheckpointCompressor(ContextEngine):
         )
         self.tail_preserve_tokens = tail_preserve_tokens
         self.tail_token_budget = tail_preserve_tokens
-        self.threshold_percent = auto_compact_at_tokens / context_limit_tokens
+        self.threshold_percent = compaction_threshold_percent
         self.threshold_tokens = auto_compact_at_tokens
 
     @staticmethod
@@ -544,8 +553,8 @@ class OperationalCheckpointCompressor(ContextEngine):
         self.api_key = api_key
         self.api_mode = api_mode
         self.context_length = as_positive_int(context_length_raw, self.context_length)
-        self.threshold_percent = self.auto_compact_at_tokens / self.context_length
-        self.threshold_tokens = self.auto_compact_at_tokens
+        self.threshold_tokens = max(1, int(self.context_length * self.threshold_percent))
+        self.auto_compact_at_tokens = self.threshold_tokens
 
     def update_from_response(self, usage: dict[str, object]) -> None:
         self.last_prompt_tokens = self._coerce_non_negative_int(

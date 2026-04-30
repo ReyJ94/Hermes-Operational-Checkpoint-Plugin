@@ -2,8 +2,7 @@
 model = "gpt-5.4-mini"
 reasoning_effort = "medium"
 summary_retry_attempts = 3
-context_limit_tokens = 400000
-auto_compact_at_tokens = 350000
+compaction_threshold_percent = 0.85
 head_preserve_messages = 0
 minimum_tail_messages = 0
 tail_preserve_tokens = 0

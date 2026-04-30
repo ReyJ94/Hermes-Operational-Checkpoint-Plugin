@@ -144,8 +144,7 @@ The shipped defaults live in `operational_checkpoint.toml`:
 model = "gpt-5.4-mini"
 reasoning_effort = "medium"
 summary_retry_attempts = 3
-context_limit_tokens = 400000
-auto_compact_at_tokens = 350000
+compaction_threshold_percent = 0.85
 head_preserve_messages = 0
 minimum_tail_messages = 0
 tail_preserve_tokens = 0
@@ -156,12 +155,11 @@ show_summary_preview = false
 summary_preview_chars = 160
 ```
 
-Hermes config can override them:
+Hermes config can override them. The context window itself is resolved from the active provider/model metadata (or Hermes' normal `model.context_length` override for custom runtimes); the plugin only owns the fraction at which to compact:
 
 ```yaml
 operational_checkpoint:
-  context_limit_tokens: 400000
-  auto_compact_at_tokens: 350000
+  compaction_threshold_percent: 0.85
   head_preserve_messages: 0
   minimum_tail_messages: 0
   tail_preserve_tokens: 0
@@ -179,8 +177,8 @@ If you want head or tail protection, set those values explicitly. The default is
 During auto-compaction, you may see:
 
 ```text
-🗜️  Operational Checkpoint: auto-compacting ~123,456 / 350,000 tokens...
-  ✅ Operational Checkpoint reduced active context budget: ~123,456 → ~18,200 tokens
+🗜️  Operational Checkpoint: auto-compacting ~231,456 / 231,200 tokens...
+  ✅ Operational Checkpoint reduced active context budget: ~231,456 → ~18,200 tokens
 ```
 
 The wording is intentional. Message counts become misleading once checkpointing and hydration are involved. The useful number is how much active context budget was reduced.

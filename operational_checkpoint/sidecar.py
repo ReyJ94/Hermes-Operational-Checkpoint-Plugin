@@ -259,30 +259,96 @@ def _find_tui_server_for_agent(agent: object) -> ModuleType | None:
     return None
 
 
-def _emit_tui_usage_update(agent: object) -> None:
-    """Refresh the TUI's existing session.info usage snapshot after token changes."""
+def _tui_session_for_agent(agent: object) -> tuple[ModuleType, str, dict[str, object]] | None:
     module: ModuleType | None = _find_tui_server_for_agent(agent)
     if module is None:
-        return
+        return None
     sessions: object = getattr(module, "_sessions", None)
-    emit: object = getattr(module, "_emit", None)
-    session_info: object = getattr(module, "_session_info", None)
-    if not isinstance(sessions, dict) or not callable(emit) or not callable(session_info):
-        return
+    if not isinstance(sessions, dict):
+        return None
     sid: str
     session: object
     for sid, session in sessions.items():
         if not isinstance(sid, str) or not isinstance(session, dict):
             continue
-        if session.get("agent") is not agent:
-            continue
-        try:
-            info_payload: object = session_info(agent)
-            if isinstance(info_payload, dict):
-                emit("session.info", sid, info_payload)
-        except Exception:
-            logger.debug("Operational Checkpoint TUI usage update failed", exc_info=True)
+        if session.get("agent") is agent:
+            return module, sid, session
+    return None
+
+
+def _active_messages_for_agent(agent: object) -> list[dict[str, object]] | None:
+    tui_session: tuple[ModuleType, str, dict[str, object]] | None = _tui_session_for_agent(agent)
+    if tui_session is not None:
+        _module, _sid, session = tui_session
+        history: object = session.get("history")
+        if isinstance(history, list):
+            return [message for message in history if isinstance(message, dict)]
+
+    session_messages: object = getattr(agent, "_session_messages", None)
+    if isinstance(session_messages, list):
+        return [message for message in session_messages if isinstance(message, dict)]
+    return None
+
+
+def _set_context_token_state(
+    *,
+    engine: CompactionCallbackEngineLike,
+    request_tokens: int,
+    persist: bool = True,
+) -> int:
+    normalized_tokens: int = max(0, request_tokens)
+    engine.last_prompt_tokens = normalized_tokens
+    engine.last_completion_tokens = 0
+    engine.last_total_tokens = normalized_tokens
+    if persist:
+        _persist_engine_session_state(engine)
+    return normalized_tokens
+
+
+def _refresh_context_token_state(
+    *,
+    agent: object,
+    engine: CompactionCallbackEngineLike,
+    messages: list[dict[str, object]] | None = None,
+    system_prompt: str | None = None,
+    persist: bool = True,
+) -> int | None:
+    active_messages: list[dict[str, object]] | None = messages
+    if active_messages is None:
+        active_messages = _active_messages_for_agent(agent)
+    if active_messages is None:
+        return None
+    active_system_prompt: str = (
+        system_prompt if system_prompt is not None else _active_system_prompt(agent, "")
+    )
+    request_tokens: int = _estimate_request_tokens(
+        agent=agent,
+        messages=active_messages,
+        system_prompt=active_system_prompt,
+    )
+    return _set_context_token_state(
+        engine=engine,
+        request_tokens=request_tokens,
+        persist=persist,
+    )
+
+
+def _emit_tui_usage_update(agent: object) -> None:
+    """Refresh the TUI's existing session.info usage snapshot after token changes."""
+    tui_session: tuple[ModuleType, str, dict[str, object]] | None = _tui_session_for_agent(agent)
+    if tui_session is None:
         return
+    module, sid, _session = tui_session
+    emit: object = getattr(module, "_emit", None)
+    session_info: object = getattr(module, "_session_info", None)
+    if not callable(emit) or not callable(session_info):
+        return
+    try:
+        info_payload: object = session_info(agent)
+        if isinstance(info_payload, dict):
+            emit("session.info", sid, info_payload)
+    except Exception:
+        logger.debug("Operational Checkpoint TUI usage update failed", exc_info=True)
 
 
 def _install_usage_update_hook(agent: object, engine: CompactionCallbackEngineLike) -> None:
@@ -295,6 +361,7 @@ def _install_usage_update_hook(agent: object, engine: CompactionCallbackEngineLi
 
     def wrapped_update_from_response(usage: dict[str, object]) -> object:
         result: object = original_update(usage)
+        _refresh_context_token_state(agent=agent, engine=engine)
         _emit_tui_usage_update(agent)
         return result
 
@@ -344,22 +411,12 @@ def _current_request_tokens(
     messages: list[dict[str, object]],
     system_prompt: str,
 ) -> int:
-    estimated_request_tokens: int = _estimate_request_tokens(
+    del engine
+    return _estimate_request_tokens(
         agent=agent,
         messages=messages,
         system_prompt=system_prompt,
     )
-    last_prompt_tokens: object = getattr(engine, "last_prompt_tokens", None)
-    last_completion_tokens: object = getattr(engine, "last_completion_tokens", None)
-    tracked_request_tokens: int = 0
-    if (
-        isinstance(last_prompt_tokens, int)
-        and last_prompt_tokens >= 0
-        and isinstance(last_completion_tokens, int)
-        and last_completion_tokens >= 0
-    ):
-        tracked_request_tokens = last_prompt_tokens + last_completion_tokens
-    return max(estimated_request_tokens, tracked_request_tokens)
 
 
 def _copy_message_list(messages: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -529,15 +586,12 @@ def _activate_hydrated_session_state(
         record.raw_message_count + max(0, len(hydrated_history) - len(record.compacted_messages)),
     )
 
-    hydrated_tokens: int = _estimate_request_tokens(
+    _refresh_context_token_state(
         agent=agent,
+        engine=engine,
         messages=hydrated_history,
         system_prompt=_active_system_prompt(agent, ""),
     )
-    engine.last_prompt_tokens = hydrated_tokens
-    engine.last_completion_tokens = 0
-    engine.last_total_tokens = hydrated_tokens
-    _persist_engine_session_state(engine)
 
 
 def _hydrate_cli_history_from_plugin_state(
@@ -562,6 +616,56 @@ def _hydrate_cli_history_from_plugin_state(
         record=record,
     )
     object.__setattr__(cli, "conversation_history", hydrated_history)
+
+
+def _hydrate_tui_session_history_from_plugin_state(session: object) -> None:
+    if not isinstance(session, dict):
+        return
+    agent: object | None = session.get("agent")
+    if agent is None:
+        return
+    engine: object = getattr(agent, "context_compressor", None)
+    if not is_compaction_callback_engine(engine):
+        return
+    raw_history: object = session.get("history")
+    if not isinstance(raw_history, list):
+        return
+    session_id: str = (
+        string_or_empty(session.get("session_key")).strip()
+        or string_or_empty(getattr(agent, "session_id", "")).strip()
+    )
+    if not session_id:
+        return
+
+    record: PersistedCompactionState | None = _load_persisted_compaction_state(
+        session_id=session_id,
+        hermes_home=getattr(engine, "hermes_home", None),
+    )
+    if record is None:
+        _set_active_compaction_state(agent=agent, record=None)
+        return
+
+    hydrated_history: list[dict[str, object]] = _hydrate_messages_from_record(
+        raw_messages=raw_history,
+        record=record,
+    )
+    session["history"] = hydrated_history
+    session["history_version"] = int(session.get("history_version", 0) or 0) + 1
+    object.__setattr__(agent, "_session_messages", hydrated_history)
+    _set_active_compaction_state(agent=agent, record=record)
+    object.__setattr__(
+        agent,
+        "_last_flushed_db_idx",
+        record.raw_message_count + max(0, len(hydrated_history) - len(record.compacted_messages)),
+    )
+
+    _refresh_context_token_state(
+        agent=agent,
+        engine=engine,
+        messages=hydrated_history,
+        system_prompt=_active_system_prompt(agent, ""),
+    )
+    _emit_tui_usage_update(agent)
 def _reset_file_dedup(task_id: str) -> None:
     try:
         from tools.file_tools import reset_file_dedup
@@ -642,15 +746,12 @@ def _perform_plugin_owned_compaction(
         new_system_prompt = string_or_empty(build_system_prompt(system_message))
         object.__setattr__(agent, "_cached_system_prompt", new_system_prompt)
 
-    compacted_tokens: int = _estimate_request_tokens(
+    compacted_tokens: int = _refresh_context_token_state(
         agent=agent,
+        engine=engine,
         messages=compressed,
         system_prompt=new_system_prompt,
-    )
-    engine.last_prompt_tokens = compacted_tokens
-    engine.last_completion_tokens = 0
-    engine.last_total_tokens = compacted_tokens
-    _persist_engine_session_state(engine)
+    ) or 0
     _emit_tui_usage_update(agent)
     record: PersistedCompactionState | None = _persist_compaction_state(
         agent=agent,
@@ -724,84 +825,163 @@ def _install_tui_session_compress_response_hook(
         return False
     methods: object = getattr(module, "_methods", None)
     sessions: object = getattr(module, "_sessions", None)
+    emit: object = getattr(module, "_emit", None)
     original_status_update: object = getattr(module, "_status_update", None)
     if not isinstance(methods, dict) or not isinstance(sessions, dict):
         return False
     if not callable(original_status_update):
         return False
+
+    installed_any: bool = False
     original_handler: object = methods.get("session.compress")
-    if not callable(original_handler):
-        return False
-    if getattr(original_handler, "_operational_checkpoint_tui_compress_hook", False):
-        return True
+    if callable(original_handler) and not getattr(
+        original_handler,
+        "_operational_checkpoint_tui_compress_hook",
+        False,
+    ):
 
-    def patched_session_compress(rid: object, params: dict[str, object]) -> dict[str, object]:
-        sid: str = string_or_empty(params.get("session_id")).strip()
-        focus_topic: str = string_or_empty(params.get("focus_topic")).strip()
-        session: object = sessions.get(sid) if sid else None
-        agent: object | None = session.get("agent") if isinstance(session, dict) else None
-        start_tokens: int | None = None
-        if agent is not None:
-            engine: object = getattr(agent, "context_compressor", None)
-            history: object = session.get("history") if isinstance(session, dict) else None
-            if is_compaction_callback_engine(engine) and isinstance(history, list):
-                start_tokens = _current_request_tokens(
-                    agent=agent,
-                    engine=engine,
-                    messages=history,
-                    system_prompt=_active_system_prompt(agent, ""),
-                )
-
-        status_was_wrapped: bool = False
-        if start_tokens is not None:
-
-            def plugin_status_update(
-                status_sid: str,
-                kind: str,
-                text: str | None = None,
-            ) -> object:
-                if status_sid == sid and kind == "compressing":
-                    line = (
-                        "🗜️  Operational Checkpoint: compacting active context budget "
-                        f"{_fmt_tokens(start_tokens)} tokens"
+        def patched_session_compress(rid: object, params: dict[str, object]) -> dict[str, object]:
+            sid: str = string_or_empty(params.get("session_id")).strip()
+            focus_topic: str = string_or_empty(params.get("focus_topic")).strip()
+            session: object = sessions.get(sid) if sid else None
+            agent: object | None = session.get("agent") if isinstance(session, dict) else None
+            start_tokens: int | None = None
+            if agent is not None:
+                engine: object = getattr(agent, "context_compressor", None)
+                history: object = session.get("history") if isinstance(session, dict) else None
+                if is_compaction_callback_engine(engine) and isinstance(history, list):
+                    start_tokens = _current_request_tokens(
+                        agent=agent,
+                        engine=engine,
+                        messages=history,
+                        system_prompt=_active_system_prompt(agent, ""),
                     )
+
+            status_was_wrapped: bool = False
+            tool_id: str | None = None
+            tool_started_at: float | None = None
+            if start_tokens is not None:
+                if callable(emit):
+                    tool_id = f"operational-checkpoint-compress-{sid}"
+                    tool_started_at = time.monotonic()
+                    tool_context = f"active context budget {_fmt_tokens(start_tokens)} tokens"
                     if focus_topic:
-                        line = f'{line}, focus: "{focus_topic}"'
-                    return original_status_update(status_sid, kind, line + "...")
-                return original_status_update(status_sid, kind, text)
+                        tool_context = f'{tool_context}, focus: "{focus_topic}"'
+                    emit(
+                        "tool.start",
+                        sid,
+                        {
+                            "tool_id": tool_id,
+                            "name": "operational_checkpoint",
+                            "context": tool_context,
+                        },
+                    )
 
-            setattr(module, "_status_update", plugin_status_update)
-            status_was_wrapped = True
+                def plugin_status_update(
+                    status_sid: str,
+                    kind: str,
+                    text: str | None = None,
+                ) -> object:
+                    if status_sid == sid and kind == "compressing":
+                        line = (
+                            "Operational Checkpoint: compacting active context budget "
+                            f"{_fmt_tokens(start_tokens)} tokens"
+                        )
+                        if focus_topic:
+                            line = f'{line}, focus: "{focus_topic}"'
+                        # Keep the status bar truthful without asking the TUI to
+                        # render a static transcript row.  The animated inline
+                        # indicator is carried by the existing ToolTrail
+                        # `tool.start`/`tool.complete` event path above.
+                        return original_status_update(status_sid, "status", line + "...")
+                    return original_status_update(status_sid, kind, text)
 
-        try:
-            with compaction_trigger_scope("manual"), swallow_compaction_preview():
-                response: object = original_handler(rid, params)
-        finally:
-            if status_was_wrapped:
-                setattr(module, "_status_update", original_status_update)
+                setattr(module, "_status_update", plugin_status_update)
+                status_was_wrapped = True
 
-        if not isinstance(response, dict) or agent is None:
-            return response if isinstance(response, dict) else {}
-        result: object = response.get("result")
-        if not isinstance(result, dict):
+            tool_error: str | None = None
+            try:
+                with compaction_trigger_scope("manual"), swallow_compaction_preview():
+                    response: object = original_handler(rid, params)
+            except Exception as exc:
+                tool_error = str(exc)
+                raise
+            finally:
+                if tool_id is not None and callable(emit):
+                    duration_s: float | None = None
+                    if tool_started_at is not None:
+                        duration_s = max(0.0, time.monotonic() - tool_started_at)
+                    payload: dict[str, object] = {
+                        "tool_id": tool_id,
+                        "name": "operational_checkpoint",
+                        "summary": (
+                            "compaction failed"
+                            if tool_error
+                            else "active context checkpoint updated"
+                        ),
+                    }
+                    if tool_error:
+                        payload["error"] = tool_error
+                    if duration_s is not None:
+                        payload["duration_s"] = duration_s
+                    emit("tool.complete", sid, payload)
+                if status_was_wrapped:
+                    setattr(module, "_status_update", original_status_update)
+
+            if not isinstance(response, dict) or agent is None:
+                return response if isinstance(response, dict) else {}
+            result: object = response.get("result")
+            if not isinstance(result, dict):
+                return response
+            artifact: dict[str, object] | None = latest_compaction_artifact_for_agent(agent)
+            if artifact is None:
+                return response
+            tokens_before_raw: object = artifact.get("tokens_before")
+            tokens_after_raw: object = artifact.get("tokens_after")
+            if isinstance(tokens_before_raw, int):
+                result["before_tokens"] = tokens_before_raw
+            if isinstance(tokens_after_raw, int):
+                result["after_tokens"] = tokens_after_raw
+            result["summary"] = _tui_compaction_summary(artifact)
+            result["operational_checkpoint"] = artifact
+            # The TUI treats a `messages` field in session.compress as a command to
+            # replace the visible transcript. Operational Checkpoint only replaces
+            # the model's active context; the user's visible scrollback should stay
+            # intact while status/usage reflect the checkpoint.
+            result.pop("messages", None)
             return response
-        artifact: dict[str, object] | None = latest_compaction_artifact_for_agent(agent)
-        if artifact is None:
+
+        setattr(patched_session_compress, "_operational_checkpoint_tui_compress_hook", True)
+        methods["session.compress"] = patched_session_compress
+        installed_any = True
+
+    original_resume_handler: object = methods.get("session.resume")
+    if callable(original_resume_handler) and not getattr(
+        original_resume_handler,
+        "_operational_checkpoint_tui_resume_hook",
+        False,
+    ):
+
+        def patched_session_resume(rid: object, params: dict[str, object]) -> dict[str, object]:
+            response: object = original_resume_handler(rid, params)
+            if not isinstance(response, dict):
+                return {}
+            result: object = response.get("result")
+            if not isinstance(result, dict):
+                return response
+            sid: str = string_or_empty(result.get("session_id")).strip()
+            session: object = sessions.get(sid) if sid else None
+            _hydrate_tui_session_history_from_plugin_state(session)
             return response
-        tokens_before_raw: object = artifact.get("tokens_before")
-        tokens_after_raw: object = artifact.get("tokens_after")
-        if isinstance(tokens_before_raw, int):
-            result["before_tokens"] = tokens_before_raw
-        if isinstance(tokens_after_raw, int):
-            result["after_tokens"] = tokens_after_raw
-        result["summary"] = _tui_compaction_summary(artifact)
-        result["operational_checkpoint"] = artifact
-        return response
 
-    setattr(patched_session_compress, "_operational_checkpoint_tui_compress_hook", True)
-    methods["session.compress"] = patched_session_compress
-    return True
+        setattr(patched_session_resume, "_operational_checkpoint_tui_resume_hook", True)
+        methods["session.resume"] = patched_session_resume
+        installed_any = True
 
+    return installed_any or bool(
+        getattr(methods.get("session.compress"), "_operational_checkpoint_tui_compress_hook", False)
+        or getattr(methods.get("session.resume"), "_operational_checkpoint_tui_resume_hook", False)
+    )
 
 def _normalize_summary_preview(summary: str) -> str:
     compact: str = " ".join(summary.split())
@@ -890,7 +1070,7 @@ def _emit_start_status(
     if isinstance(threshold_tokens, int) and threshold_tokens > 0:
         threshold_text = f" / {threshold_tokens:,}"
     line: str = (
-        "🗜️  Operational Checkpoint: auto-compacting "
+        "Operational Checkpoint: auto-compacting "
         f"{_fmt_tokens(approx_tokens)}{threshold_text} tokens"
     )
     if focus_topic:
@@ -919,13 +1099,13 @@ def _emit_end_status(
         return
 
     if status.compression_count_after <= status.compression_count_before:
-        _safe_emit(agent, "  🗜️  Operational Checkpoint made no further reduction.")
+        _safe_emit(agent, "  Operational Checkpoint made no further reduction.")
         return
 
     _safe_emit(
         agent,
         (
-            "  ✅ Operational Checkpoint reduced active context budget: "
+            "  Operational Checkpoint reduced active context budget: "
             f"{_fmt_tokens(status.tokens_before)} → {_fmt_tokens(status.tokens_after)} tokens"
         ),
     )
@@ -940,7 +1120,7 @@ def _emit_failure_status(
 ) -> None:
     if not _should_emit_status() or trigger == "manual":
         return
-    _safe_emit(agent, f"  ❌ Operational Checkpoint failed: {exc}")
+    _safe_emit(agent, f"  Operational Checkpoint failed: {exc}")
 
 
 def _load_original_init_agent(
