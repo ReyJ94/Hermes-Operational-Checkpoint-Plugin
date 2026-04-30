@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 _COMPRESS_CONTEXT_RESULT_LEN: int = 2
 _DEFERRED_INSTALL_POLL_INTERVAL_SECONDS: float = 0.05
 _DEFERRED_INSTALL_TIMEOUT_SECONDS: float = 5.0
+_LIVE_STREAM_USAGE_MIN_CHARS: int = 800
+_LIVE_STREAM_USAGE_MIN_INTERVAL_SECONDS: float = 0.75
 _TRIGGER_STATE: threading.local = threading.local()
 _SIDECAR_INSTALL_LOCK: threading.Lock = threading.Lock()
 _SIDECAR_INSTALL_SCHEDULED: bool = False
@@ -46,6 +48,8 @@ class AgentRuntimeState:
     compaction_state: PersistedCompactionState | None = None
     hydrated_cursor: int | None = None
     last_compaction_artifact: dict[str, object] | None = None
+    live_stream_chars_since_emit: int = 0
+    live_stream_last_emit: float = 0.0
 
 
 _CLI_RUNTIME_STATE: WeakKeyDictionary[object, CLIRuntimeState] = WeakKeyDictionary()
@@ -100,6 +104,8 @@ class CLIBridgeTarget(Protocol):
 
 class AgentBridgeTarget(Protocol):
     def _compress_context(self, *args: object, **kwargs: object) -> tuple[object, object]: ...
+
+    def run_conversation(self, *args: object, **kwargs: object) -> object: ...
 
 
 def _cli_runtime_state(cli: object) -> CLIRuntimeState:
@@ -277,6 +283,10 @@ def _tui_session_for_agent(agent: object) -> tuple[ModuleType, str, dict[str, ob
 
 
 def _active_messages_for_agent(agent: object) -> list[dict[str, object]] | None:
+    session_messages: object = getattr(agent, "_session_messages", None)
+    if isinstance(session_messages, list):
+        return [message for message in session_messages if isinstance(message, dict)]
+
     tui_session: tuple[ModuleType, str, dict[str, object]] | None = _tui_session_for_agent(agent)
     if tui_session is not None:
         _module, _sid, session = tui_session
@@ -284,9 +294,6 @@ def _active_messages_for_agent(agent: object) -> list[dict[str, object]] | None:
         if isinstance(history, list):
             return [message for message in history if isinstance(message, dict)]
 
-    session_messages: object = getattr(agent, "_session_messages", None)
-    if isinstance(session_messages, list):
-        return [message for message in session_messages if isinstance(message, dict)]
     return None
 
 
@@ -512,6 +519,60 @@ def _load_persisted_compaction_state(
     return states.get(session_id)
 
 
+def _copy_message_list(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [dict(message) for message in messages]
+
+
+def _message_for_current_user_turn(user_message: object) -> dict[str, object]:
+    return {"role": "user", "content": user_message}
+
+
+def _wrap_stream_callback_for_live_usage(
+    *,
+    agent: object,
+    engine: CompactionCallbackEngineLike,
+    stream_callback: object,
+    base_messages: list[dict[str, object]],
+) -> object:
+    if not callable(stream_callback):
+        return stream_callback
+
+    runtime_state: AgentRuntimeState = _agent_runtime_state(agent)
+    runtime_state.live_stream_chars_since_emit = 0
+    runtime_state.live_stream_last_emit = 0.0
+    streamed_chunks: list[str] = []
+
+    def wrapped_stream_callback(delta: object) -> object:
+        result: object = stream_callback(delta)
+        if not isinstance(delta, str) or not delta:
+            return result
+
+        streamed_chunks.append(delta)
+        runtime_state.live_stream_chars_since_emit += len(delta)
+        now: float = time.monotonic()
+        if (
+            runtime_state.live_stream_chars_since_emit < _LIVE_STREAM_USAGE_MIN_CHARS
+            and now - runtime_state.live_stream_last_emit < _LIVE_STREAM_USAGE_MIN_INTERVAL_SECONDS
+        ):
+            return result
+
+        runtime_state.live_stream_chars_since_emit = 0
+        runtime_state.live_stream_last_emit = now
+        live_messages: list[dict[str, object]] = _copy_message_list(base_messages)
+        live_messages.append({"role": "assistant", "content": "".join(streamed_chunks)})
+        _refresh_context_token_state(
+            agent=agent,
+            engine=engine,
+            messages=live_messages,
+            system_prompt=_active_system_prompt(agent, ""),
+            persist=False,
+        )
+        _emit_tui_usage_update(agent)
+        return result
+
+    return wrapped_stream_callback
+
+
 def _hydrate_messages_from_record(
     *,
     raw_messages: list[dict[str, object]],
@@ -643,6 +704,17 @@ def _hydrate_tui_session_history_from_plugin_state(session: object) -> None:
     )
     if record is None:
         _set_active_compaction_state(agent=agent, record=None)
+        return
+    if record.raw_message_count > len(raw_history):
+        logger.warning(
+            "Operational Checkpoint ignored stale TUI compaction state: session=%s raw_message_count=%d history_len=%d",
+            session_id,
+            record.raw_message_count,
+            len(raw_history),
+        )
+        _set_active_compaction_state(agent=agent, record=None)
+        _set_context_token_state(engine=engine, request_tokens=0)
+        _emit_tui_usage_update(agent)
         return
 
     hydrated_history: list[dict[str, object]] = _hydrate_messages_from_record(
@@ -1231,6 +1303,23 @@ def _load_original_compress_context(
     return original_compress_context
 
 
+def _load_original_run_conversation(
+    agent_class: type[AgentBridgeTarget],
+) -> Callable[..., object] | None:
+    candidate: object = agent_class.__dict__.get("run_conversation")
+    if not callable(candidate):
+        return None
+
+    def original_run_conversation(
+        self: AgentBridgeTarget,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        return candidate(self, *args, **kwargs)
+
+    return original_run_conversation
+
+
 def _load_original_flush_messages_to_session_db(
     agent_class: type[AgentBridgeTarget],
 ) -> Callable[..., None] | None:
@@ -1493,6 +1582,117 @@ def _build_patched_compress_context(
     return patched_compress_context
 
 
+def _build_patched_run_conversation(
+    original_run_conversation: Callable[..., object],
+) -> Callable[..., object]:
+    def patched_run_conversation(
+        self: AgentBridgeTarget,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        engine: object = getattr(self, "context_compressor", None)
+        if not is_compaction_callback_engine(engine):
+            return original_run_conversation(self, *args, **kwargs)
+
+        raw_history: object = kwargs.get("conversation_history")
+        positional_history: bool = False
+        if raw_history is None and len(args) >= 3:
+            raw_history = args[2]
+            positional_history = True
+        if not isinstance(raw_history, list):
+            return original_run_conversation(self, *args, **kwargs)
+
+        record: PersistedCompactionState | None = _active_compaction_state(self)
+        if record is None:
+            record = _load_persisted_compaction_state(
+                session_id=string_or_empty(getattr(self, "session_id", "")).strip(),
+                hermes_home=getattr(engine, "hermes_home", None),
+            )
+            _set_active_compaction_state(agent=self, record=record)
+        if record is None or record.raw_message_count > len(raw_history):
+            return original_run_conversation(self, *args, **kwargs)
+
+        raw_dict_history: list[dict[str, object]] = [
+            message for message in raw_history if isinstance(message, dict)
+        ]
+        hydrated_history: list[dict[str, object]] = _hydrate_messages_from_record(
+            raw_messages=raw_dict_history,
+            record=record,
+        )
+        hydrated_history_len: int = len(hydrated_history)
+        current_user_message: object = kwargs.get("user_message")
+        if current_user_message is None and args:
+            current_user_message = args[0]
+        in_flight_messages: list[dict[str, object]] = _copy_message_list(hydrated_history)
+        in_flight_messages.append(_message_for_current_user_turn(current_user_message))
+        object.__setattr__(self, "_session_messages", list(in_flight_messages))
+        _refresh_context_token_state(
+            agent=self,
+            engine=engine,
+            messages=in_flight_messages,
+            system_prompt=_active_system_prompt(self, ""),
+        )
+        _emit_tui_usage_update(self)
+
+        stream_callback: object = kwargs.get("stream_callback")
+        if callable(stream_callback):
+            kwargs = {
+                **kwargs,
+                "stream_callback": _wrap_stream_callback_for_live_usage(
+                    agent=self,
+                    engine=engine,
+                    stream_callback=stream_callback,
+                    base_messages=in_flight_messages,
+                ),
+            }
+
+        if "conversation_history" in kwargs or not positional_history:
+            result: object = original_run_conversation(
+                self,
+                *args,
+                **{**kwargs, "conversation_history": hydrated_history},
+            )
+        else:
+            mutable_args: list[object] = list(args)
+            mutable_args[2] = hydrated_history
+            result = original_run_conversation(self, *mutable_args, **kwargs)
+
+        if not isinstance(result, dict):
+            return result
+        result_messages: object = result.get("messages")
+        if not isinstance(result_messages, list) or len(result_messages) < hydrated_history_len:
+            return result
+
+        new_messages: list[dict[str, object]] = [
+            message for message in result_messages[hydrated_history_len:] if isinstance(message, dict)
+        ]
+        visible_messages: list[dict[str, object]] = _copy_message_list(raw_dict_history)
+        visible_messages.extend(_copy_message_list(new_messages))
+        patched_result: dict[str, object] = {**result, "messages": visible_messages}
+
+        # The TUI keeps visible scrollback as raw transcript history, but model
+        # calls after a checkpoint must continue from the compacted active state.
+        # Recompute the active state from the raw-visible transcript so the next
+        # prompt.submit does not silently feed the full raw scrollback back into
+        # the provider.
+        active_messages: list[dict[str, object]] = _hydrate_messages_from_record(
+            raw_messages=visible_messages,
+            record=record,
+        )
+        object.__setattr__(self, "_session_messages", active_messages)
+        _agent_runtime_state(self).hydrated_cursor = len(active_messages)
+        _refresh_context_token_state(
+            agent=self,
+            engine=engine,
+            messages=active_messages,
+            system_prompt=_active_system_prompt(self, ""),
+        )
+        _emit_tui_usage_update(self)
+        return patched_result
+
+    return patched_run_conversation
+
+
 def _build_patched_flush_messages_to_session_db(
     original_flush_messages_to_session_db: Callable[..., None],
 ) -> Callable[..., None]:
@@ -1609,6 +1809,9 @@ def install_agent_runtime_bridge(
     original_compress_context: Callable[..., tuple[object, object]] = (
         _load_original_compress_context(agent_class)
     )
+    original_run_conversation: Callable[..., object] | None = (
+        _load_original_run_conversation(agent_class)
+    )
     original_flush_messages_to_session_db: Callable[..., None] | None = (
         _load_original_flush_messages_to_session_db(agent_class)
     )
@@ -1627,6 +1830,12 @@ def install_agent_runtime_bridge(
         "_compress_context",
         _build_patched_compress_context(original_compress_context),
     )
+    if original_run_conversation is not None:
+        type.__setattr__(
+            agent_class,
+            "run_conversation",
+            _build_patched_run_conversation(original_run_conversation),
+        )
     if original_flush_messages_to_session_db is not None:
         type.__setattr__(
             agent_class,

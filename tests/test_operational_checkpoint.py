@@ -383,6 +383,342 @@ def test_agent_runtime_bridge_refreshes_tui_usage_after_response_usage_update(
 
 
 
+def test_tui_usage_refresh_prefers_active_compacted_messages_over_visible_history(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    tui_module = ModuleType("tui_gateway.server")
+    emitted: list[tuple[str, str, dict[str, object]]] = []
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.compression_count = 1
+            self.context_length = 400_000
+            self.hermes_home = None
+            self.last_checkpoint_summary = "summary"
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def update_from_response(self, usage: dict[str, object]) -> None:
+            self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            del callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return False
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del current_tokens, focus_topic
+            return messages
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.platform = "tui"
+            self.session_id = "session-live"
+            self._session_messages = [{"role": "assistant", "content": "checkpoint"}]
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del runtime_kwargs
+            return messages, system_message
+
+    def emit(event: str, sid: str, payload: dict[str, object]) -> None:
+        emitted.append((event, sid, payload))
+
+    def session_info(agent: object) -> dict[str, object]:
+        engine = getattr(agent, "context_compressor")
+        return {"usage": {"context_used": engine.last_prompt_tokens}}
+
+    tui_module._emit = emit
+    tui_module._session_info = session_info
+    tui_module._sessions = {}
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", tui_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "estimate_request_tokens_rough",
+        lambda messages, *, system_prompt="", tools=None: len(messages) * 100,
+    )
+
+    sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
+    agent = FakeAgent()
+    tui_module._sessions = {
+        "sid-live": {
+            "agent": agent,
+            "history": [{"role": "user", "content": str(index)} for index in range(20)],
+        }
+    }
+
+    agent.context_compressor.update_from_response(
+        {"prompt_tokens": 252_000, "completion_tokens": 1_000, "total_tokens": 253_000}
+    )
+
+    assert agent.context_compressor.last_prompt_tokens == 100
+    assert emitted == [("session.info", "sid-live", {"usage": {"context_used": 100}})]
+
+
+
+def test_tui_prompt_submit_uses_compacted_active_history_without_replacing_visible_history(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, helpers_module, sidecar_module = plugin_modules
+    tui_module = ModuleType("tui_gateway.server")
+    emitted: list[tuple[str, str, dict[str, object]]] = []
+    seen_histories: list[list[dict[str, object]]] = []
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.bound_session_id = ""
+            self.compression_count = 1
+            self.context_length = 400_000
+            self.hermes_home = None
+            self.last_checkpoint_summary = "summary"
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def update_from_response(self, usage: dict[str, object]) -> None:
+            self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            del callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return False
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del current_tokens, focus_topic
+            return messages
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.platform = "tui"
+            self.session_id = "session-live"
+            self._cached_system_prompt = "system"
+            self.tools = []
+
+        def _compress_context(
+            self,
+            messages: list[dict[str, object]],
+            system_message: str,
+            **runtime_kwargs: object,
+        ) -> tuple[list[dict[str, object]], str]:
+            del runtime_kwargs
+            return messages, system_message
+
+        def run_conversation(
+            self,
+            user_message: str,
+            system_message: str | None = None,
+            conversation_history: list[dict[str, object]] | None = None,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            del system_message, kwargs
+            seen = list(conversation_history or [])
+            seen_histories.append(seen)
+            return {
+                "final_response": "ok",
+                "messages": seen
+                + [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
+
+    def emit(event: str, sid: str, payload: dict[str, object]) -> None:
+        emitted.append((event, sid, payload))
+
+    def session_info(agent: object) -> dict[str, object]:
+        engine = getattr(agent, "context_compressor")
+        return {"usage": {"context_used": engine.last_prompt_tokens}}
+
+    tui_module._emit = emit
+    tui_module._session_info = session_info
+    tui_module._sessions = {}
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", tui_module)
+    monkeypatch.setattr(
+        sidecar_module,
+        "estimate_request_tokens_rough",
+        lambda messages, *, system_prompt="", tools=None: len(messages) * 100 + len(system_prompt),
+    )
+
+    sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
+    agent = FakeAgent()
+    raw_history = [{"role": "user", "content": f"raw-{index}"} for index in range(12)]
+    record = helpers_module.PersistedCompactionState(
+        compacted_messages=[{"role": "assistant", "content": "checkpoint"}],
+        compression_count=1,
+        focus_topic=None,
+        raw_message_count=10,
+        summary="summary",
+        tokens_after=100,
+        tokens_before=1000,
+        updated_at=123.0,
+    )
+    sidecar_module._set_active_compaction_state(agent=agent, record=record)
+    tui_module._sessions = {
+        "sid-live": {
+            "agent": agent,
+            "history": raw_history,
+        }
+    }
+
+    result = agent.run_conversation("new", conversation_history=list(raw_history))
+
+    assert seen_histories == [
+        [
+            {"role": "assistant", "content": "checkpoint"},
+            {"role": "user", "content": "raw-10"},
+            {"role": "user", "content": "raw-11"},
+        ]
+    ]
+    assert result["messages"] == raw_history + [
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert agent._session_messages == [
+        {"role": "assistant", "content": "checkpoint"},
+        {"role": "user", "content": "raw-10"},
+        {"role": "user", "content": "raw-11"},
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert agent.context_compressor.last_prompt_tokens == 5 * 100 + len("system")
+    assert emitted == [
+        ("session.info", "sid-live", {"usage": {"context_used": 406}}),
+        ("session.info", "sid-live", {"usage": {"context_used": 506}}),
+    ]
+
+
+
+def test_tui_hydration_ignores_stale_compaction_state_that_is_ahead_of_history(
+    plugin_modules: PluginModules,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _package, _compressor_module, helpers_module, sidecar_module = plugin_modules
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.compression_count = 1
+            self.context_length = 400_000
+            self.hermes_home = None
+            self.last_checkpoint_summary = "summary"
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 0
+            self.last_total_tokens = 0
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            del callback
+
+        def persist_usage_snapshot(self) -> None:
+            self.persisted = True
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self.session_id = "session-live"
+
+    agent = FakeAgent()
+    raw_history = [
+        {"role": "user", "content": "real latest request"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+    session: dict[str, object] = {
+        "agent": agent,
+        "session_key": "session-live",
+        "history": list(raw_history),
+    }
+    record = helpers_module.PersistedCompactionState(
+        compacted_messages=[{"role": "assistant", "content": "checkpoint only"}],
+        compression_count=7,
+        focus_topic=None,
+        raw_message_count=200,
+        summary="checkpoint only",
+        tokens_after=24_251,
+        tokens_before=36_565,
+        updated_at=1.0,
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "_load_persisted_compaction_state",
+        lambda *, session_id, hermes_home: record,
+    )
+
+    sidecar_module._hydrate_tui_session_history_from_plugin_state(session)
+
+    assert session["history"] == raw_history
+    assert not hasattr(agent, "_session_messages")
+    assert agent.context_compressor.last_prompt_tokens == 0
+    assert agent.context_compressor.last_total_tokens == 0
+    assert agent.context_compressor.persisted is True
+
+
+
 def test_install_plugin_sidecar_installs_when_targets_are_ready(
     plugin_modules: PluginModules,
     monkeypatch: pytest.MonkeyPatch,
@@ -755,6 +1091,56 @@ def test_compress_uses_plugin_owned_checkpoint_assembly_and_updates_previous_sum
     assert "PREVIOUS CHECKPOINT:\n1. Objective\n- [Observed] first checkpoint" in prompts[1]
     assert "NEW TURNS TO INCORPORATE:" in prompts[1]
     assert engine.last_checkpoint_summary.startswith("1. Objective\n- [Observed] updated checkpoint")
+
+
+
+def test_compress_preserves_latest_turn_even_with_zero_configured_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, compressor_module, _helpers_module, _sidecar_module = plugin_modules
+
+    monkeypatch.setattr(
+        compressor_module,
+        "load_runtime_defaults",
+        lambda: {
+            "auto_compact_at_tokens": 900,
+            "base_url": "",
+            "config_context_length": 1_000,
+            "context_limit_tokens": 1_000,
+            "head_preserve_messages": 0,
+            "minimum_tail_messages": 0,
+            "model": "gpt-5.4",
+            "provider": "",
+            "reasoning_effort": "",
+            "summary_retry_attempts": 3,
+            "tail_preserve_tokens": 0,
+        },
+    )
+    monkeypatch.setattr(
+        compressor_module.OperationalCheckpointCompressor,
+        "_generate_summary",
+        lambda self, turns_to_summarize, focus_topic=None: self._with_summary_prefix(
+            checkpoint_summary("preserve current request")
+        ),
+    )
+
+    engine = compressor_module.OperationalCheckpointCompressor()
+    latest_user = {"role": "user", "content": "CURRENT REQUEST: answer this"}
+    compacted = engine.compress(
+        [
+            {"role": "user", "content": "old user " + ("x" * 280)},
+            {"role": "assistant", "content": "old assistant " + ("y" * 280)},
+            latest_user,
+        ]
+    )
+
+    assert compacted[-1] == latest_user
+    assert any(
+        compressor_module.SUMMARY_PREFIX in str(message.get("content", ""))
+        for message in compacted[:-1]
+    )
+
 
 
 def test_compress_inserts_plugin_owned_fallback_checkpoint_when_summary_fails(

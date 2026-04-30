@@ -821,8 +821,11 @@ class OperationalCheckpointCompressor(ContextEngine):
         head_end: int,
     ) -> int:
         token_budget: int = max(0, self.tail_token_budget)
+        configured_minimum_tail: int = self.minimum_tail_messages
+        if messages and _message_role(messages[-1]) == "user":
+            configured_minimum_tail = max(1, configured_minimum_tail)
         minimum_tail: int = min(
-            self.minimum_tail_messages,
+            configured_minimum_tail,
             max(0, len(messages) - head_end - _MINIMUM_MESSAGES_TO_COMPACT),
         )
         if minimum_tail <= 0 and token_budget <= 0:
