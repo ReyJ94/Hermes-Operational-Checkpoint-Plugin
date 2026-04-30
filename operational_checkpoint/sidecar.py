@@ -306,9 +306,15 @@ def _bind_agent_runtime_hooks(agent: object) -> None:
     engine: object = getattr(agent, "context_compressor", None)
     if not is_compaction_callback_engine(engine):
         return
+
+    def callback(payload: dict[str, str | None]) -> None:
+        _record_compaction_artifact(agent=agent, payload=payload)
+
+    engine.set_compaction_callback(callback)
     _install_usage_update_hook(agent, engine)
     if string_or_empty(getattr(agent, "platform", "")).strip().lower() == "tui":
         _bind_engine_session_state(agent, engine)
+    _install_tui_session_compress_response_hook()
 
 
 def _active_system_prompt(agent: object, fallback: str) -> str:
@@ -673,6 +679,128 @@ def _fmt_tokens(value: int | None) -> str:
     if isinstance(value, int) and value >= 0:
         return f"~{value:,}"
     return "unknown"
+
+
+def _tui_compaction_summary(artifact: dict[str, object]) -> dict[str, object]:
+    tokens_before_raw: object = artifact.get("tokens_before")
+    tokens_after_raw: object = artifact.get("tokens_after")
+    compression_count_raw: object = artifact.get("compression_count")
+    tokens_before: int | None = (
+        tokens_before_raw if isinstance(tokens_before_raw, int) else None
+    )
+    tokens_after: int | None = (
+        tokens_after_raw if isinstance(tokens_after_raw, int) else None
+    )
+    compression_count: int = (
+        compression_count_raw if isinstance(compression_count_raw, int) else 0
+    )
+    no_reduction: bool = (
+        tokens_before is not None
+        and tokens_after is not None
+        and tokens_after >= tokens_before
+    )
+    if no_reduction or compression_count <= 0:
+        headline = "Operational Checkpoint made no further reduction"
+    else:
+        headline = "Operational Checkpoint reduced active context budget"
+    return {
+        "headline": headline,
+        "noop": no_reduction,
+        "note": "Message counts are internal here; the useful number is active context budget.",
+        "token_line": (
+            f"Active context budget: {_fmt_tokens(tokens_before)} → "
+            f"{_fmt_tokens(tokens_after)} tokens"
+        ),
+    }
+
+
+def _install_tui_session_compress_response_hook(
+    server_module: ModuleType | None = None,
+) -> bool:
+    module: ModuleType | None = (
+        server_module if server_module is not None else sys.modules.get("tui_gateway.server")
+    )
+    if module is None:
+        return False
+    methods: object = getattr(module, "_methods", None)
+    sessions: object = getattr(module, "_sessions", None)
+    original_status_update: object = getattr(module, "_status_update", None)
+    if not isinstance(methods, dict) or not isinstance(sessions, dict):
+        return False
+    if not callable(original_status_update):
+        return False
+    original_handler: object = methods.get("session.compress")
+    if not callable(original_handler):
+        return False
+    if getattr(original_handler, "_operational_checkpoint_tui_compress_hook", False):
+        return True
+
+    def patched_session_compress(rid: object, params: dict[str, object]) -> dict[str, object]:
+        sid: str = string_or_empty(params.get("session_id")).strip()
+        focus_topic: str = string_or_empty(params.get("focus_topic")).strip()
+        session: object = sessions.get(sid) if sid else None
+        agent: object | None = session.get("agent") if isinstance(session, dict) else None
+        start_tokens: int | None = None
+        if agent is not None:
+            engine: object = getattr(agent, "context_compressor", None)
+            history: object = session.get("history") if isinstance(session, dict) else None
+            if is_compaction_callback_engine(engine) and isinstance(history, list):
+                start_tokens = _current_request_tokens(
+                    agent=agent,
+                    engine=engine,
+                    messages=history,
+                    system_prompt=_active_system_prompt(agent, ""),
+                )
+
+        status_was_wrapped: bool = False
+        if start_tokens is not None:
+
+            def plugin_status_update(
+                status_sid: str,
+                kind: str,
+                text: str | None = None,
+            ) -> object:
+                if status_sid == sid and kind == "compressing":
+                    line = (
+                        "🗜️  Operational Checkpoint: compacting active context budget "
+                        f"{_fmt_tokens(start_tokens)} tokens"
+                    )
+                    if focus_topic:
+                        line = f'{line}, focus: "{focus_topic}"'
+                    return original_status_update(status_sid, kind, line + "...")
+                return original_status_update(status_sid, kind, text)
+
+            setattr(module, "_status_update", plugin_status_update)
+            status_was_wrapped = True
+
+        try:
+            with compaction_trigger_scope("manual"), swallow_compaction_preview():
+                response: object = original_handler(rid, params)
+        finally:
+            if status_was_wrapped:
+                setattr(module, "_status_update", original_status_update)
+
+        if not isinstance(response, dict) or agent is None:
+            return response if isinstance(response, dict) else {}
+        result: object = response.get("result")
+        if not isinstance(result, dict):
+            return response
+        artifact: dict[str, object] | None = latest_compaction_artifact_for_agent(agent)
+        if artifact is None:
+            return response
+        tokens_before_raw: object = artifact.get("tokens_before")
+        tokens_after_raw: object = artifact.get("tokens_after")
+        if isinstance(tokens_before_raw, int):
+            result["before_tokens"] = tokens_before_raw
+        if isinstance(tokens_after_raw, int):
+            result["after_tokens"] = tokens_after_raw
+        result["summary"] = _tui_compaction_summary(artifact)
+        result["operational_checkpoint"] = artifact
+        return response
+
+    setattr(patched_session_compress, "_operational_checkpoint_tui_compress_hook", True)
+    methods["session.compress"] = patched_session_compress
+    return True
 
 
 def _normalize_summary_preview(summary: str) -> str:
@@ -1444,6 +1572,7 @@ def _resolve_bridge_targets(
 
 
 def _attempt_sidecar_install() -> bool:
+    _install_tui_session_compress_response_hook()
     ai_agent_class: type[AgentBridgeTarget] | None = _resolve_agent_target()
     if ai_agent_class is not None:
         install_agent_runtime_bridge(agent_class=ai_agent_class)

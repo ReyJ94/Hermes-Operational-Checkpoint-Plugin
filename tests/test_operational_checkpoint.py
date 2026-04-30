@@ -1059,6 +1059,202 @@ def test_sidecar_bridge_emits_auto_status_and_records_artifact(
     assert manual_artifact["focus_topic"] == "manual focus"
 
 
+def test_tui_session_compress_uses_plugin_owned_token_status_and_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_modules: PluginModules,
+) -> None:
+    _package, _compressor_module, _helpers_module, sidecar_module = plugin_modules
+    stored_states: dict[str, object] = {}
+    status_updates: list[tuple[str, str, str | None]] = []
+
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_operational_checkpoint_cli_config",
+        lambda: {
+            "emit_compaction_status": True,
+            "show_summary_preview": False,
+            "summary_preview_chars": 48,
+        },
+    )
+    monkeypatch.setattr(
+        sidecar_module,
+        "load_compaction_states",
+        lambda hermes_home=None: dict(stored_states),
+    )
+
+    def save_states(states: dict[str, object], hermes_home: object | None = None) -> None:
+        del hermes_home
+        stored_states.clear()
+        stored_states.update(states)
+
+    monkeypatch.setattr(sidecar_module, "save_compaction_states", save_states)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.callback: Callable[[dict[str, str | None]], None] | None = None
+            self.compression_count = 0
+            self.context_length = 400_000
+            self.last_checkpoint_summary = ""
+            self.last_completion_tokens = 0
+            self.last_prompt_tokens = 22_800
+            self.last_total_tokens = 22_800
+            self.name = "operational_checkpoint"
+            self.threshold_tokens = 350_000
+
+        def set_compaction_callback(
+            self,
+            callback: Callable[[dict[str, str | None]], None] | None,
+        ) -> None:
+            self.callback = callback
+
+        def bind_session(
+            self,
+            *,
+            session_id: str,
+            hermes_home: str | None = None,
+            parent_session_id: str | None = None,
+        ) -> None:
+            del hermes_home, parent_session_id
+            self.bound_session_id = session_id
+
+        def restore_usage_snapshot(self) -> bool:
+            return True
+
+        def persist_usage_snapshot(self) -> None:
+            return None
+
+        def compress(
+            self,
+            messages: list[dict[str, object]],
+            current_tokens: int | None = None,
+            focus_topic: str | None = None,
+        ) -> list[dict[str, object]]:
+            del messages, current_tokens
+            self.compression_count += 1
+            self.last_checkpoint_summary = "Operational state preserved."
+            if self.callback is not None:
+                self.callback(
+                    {
+                        "focus_topic": focus_topic,
+                        "summary": self.last_checkpoint_summary,
+                    }
+                )
+            return [{"role": "user", "content": "checkpoint"}]
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.context_compressor = FakeEngine()
+            self._cached_system_prompt = ""
+            self._context_pressure_warned_at = 0.0
+            self._session_db = None
+            self.platform = "tui"
+            self.session_id = "session-tui"
+            self.tools: list[dict[str, object]] = []
+
+        def _safe_print(self, line: str) -> None:
+            raise AssertionError(f"manual TUI compression should not safe-print: {line}")
+
+        def flush_memories(
+            self,
+            messages: list[dict[str, object]],
+            min_turns: int = 0,
+        ) -> None:
+            del messages, min_turns
+
+        def _invalidate_system_prompt(self) -> None:
+            self._cached_system_prompt = ""
+
+        def _build_system_prompt(self, system_message: str) -> str:
+            return system_message
+
+        def _compress_context(self, *args: object, **kwargs: object) -> tuple[list[dict[str, object]], str]:
+            del args, kwargs
+            raise AssertionError("plugin-owned compaction should bypass original _compress_context")
+
+    agent = FakeAgent()
+    history = [{"role": "user", "content": "raw"}] * 8
+    server_module = ModuleType("tui_gateway.server")
+    server_module._sessions = {"sid-tui": {"agent": agent, "history": history}}
+
+    def status_update(sid: str, kind: str, text: str | None = None) -> None:
+        status_updates.append((sid, kind, text))
+
+    def original_session_compress(rid: object, params: dict[str, object]) -> dict[str, object]:
+        del rid
+        sid = str(params["session_id"])
+        server_module._status_update(
+            sid,
+            "compressing",
+            "⠋ compressing 8 messages (~2,394 tok)…",
+        )
+        session = server_module._sessions[sid]
+        compressed, _system_prompt = session["agent"]._compress_context(
+            session["history"],
+            "",
+            approx_tokens=2_394,
+            focus_topic=params.get("focus_topic"),
+        )
+        session["history"] = compressed
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "removed": 7,
+                "before_tokens": 2_394,
+                "after_tokens": 999,
+                "summary": {
+                    "headline": "Compressed: 8 → 1 messages",
+                    "token_line": "Rough transcript estimate: ~2,394 → ~999 tokens",
+                },
+                "messages": compressed,
+            },
+        }
+
+    server_module._methods = {"session.compress": original_session_compress}
+    server_module._status_update = status_update
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", server_module)
+    sidecar_module.install_agent_runtime_bridge(agent_class=FakeAgent)
+    sidecar_module._bind_agent_runtime_hooks(agent)
+    assert sidecar_module._install_tui_session_compress_response_hook(server_module) is True
+
+    response = server_module._methods["session.compress"](
+        1,
+        {"session_id": "sid-tui", "focus_topic": "tui focus"},
+    )
+
+    expected_before = sidecar_module.estimate_request_tokens_rough(
+        history,
+        system_prompt="",
+        tools=[],
+    )
+    expected_before = max(expected_before, 22_800)
+    expected_after = sidecar_module.estimate_request_tokens_rough(
+        [{"role": "user", "content": "checkpoint"}],
+        system_prompt="",
+        tools=[],
+    )
+    assert status_updates == [
+        (
+            "sid-tui",
+            "compressing",
+            f'🗜️  Operational Checkpoint: compacting active context budget ~{expected_before:,} tokens, focus: "tui focus"...',
+        )
+    ]
+    result = response["result"]
+    assert result["before_tokens"] == expected_before
+    assert result["after_tokens"] == expected_after
+    assert result["summary"]["headline"] == "Operational Checkpoint reduced active context budget"
+    assert result["summary"]["token_line"] == (
+        f"Active context budget: ~{expected_before:,} → ~{expected_after:,} tokens"
+    )
+    assert "messages" not in result["summary"]["headline"].lower()
+    assert "Rough transcript estimate" not in result["summary"]["token_line"]
+    artifact = result["operational_checkpoint"]
+    assert artifact["trigger"] == "manual"
+    assert artifact["tokens_before"] == expected_before
+    assert artifact["tokens_after"] == expected_after
+
+
 def test_runtime_defaults_use_plugin_toml_model_and_reasoning_only(
     monkeypatch: pytest.MonkeyPatch,
     plugin_modules: PluginModules,
